@@ -4,441 +4,695 @@ on:
   workflow_dispatch:
     inputs:
       clean_build:
-        description: "Clean build cache"
-        required: false
+        description: "忽略现有 ccache，执行干净编译"
+        required: true
         default: false
         type: boolean
 
+permissions:
+  contents: read
+
+concurrency:
+  group: build-ruijie-rg-x60-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
+  TZ: Asia/Seoul
+
   OPENWRT_REPO: https://github.com/RuijieNetworksCommunity/MT798X-6.6-24.10
   OPENWRT_BRANCH: openwrt-24.10-6.6
-
   OPENWRT_DIR: openwrt
 
+  CONFIG_FILE: defconfig/x60.config
   DEVICE_NAME: ruijie-rg-x60
+  DEVICE_CONFIG: CONFIG_TARGET_mediatek_filogic_DEVICE_ruijie-rg-x60
 
-  TZ: Asia/Shanghai
-
+  OUTPUT_DIR: bin/targets/mediatek/filogic
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
 
 jobs:
-
   build:
-
+    name: Build RG-X60
     runs-on: ubuntu-24.04
-
     timeout-minutes: 360
 
-
     steps:
-
-
-    #################################################
-    # Checkout build repository
-    #################################################
-
-    - name: Checkout build files
-      uses: actions/checkout@v4
-
-
-
-    #################################################
-    # Free disk
-    #################################################
-
-    - name: Free disk space
-
-      run: |
-
-        sudo rm -rf /usr/local/lib/android
-        sudo rm -rf /usr/share/dotnet
-        sudo rm -rf /opt/ghc
-
-        sudo docker system prune -af || true
-
-        df -h
-
-
-
-    #################################################
-    # Dependencies
-    #################################################
-
-    - name: Install dependencies
-
-      env:
-        DEBIAN_FRONTEND: noninteractive
-
-      run: |
-
-        sudo apt update
-
-
-        sudo apt install -y \
-          build-essential \
-          clang \
-          flex \
-          bison \
-          gawk \
-          gcc-multilib \
-          g++-multilib \
-          gettext \
-          git \
-          libncurses-dev \
-          libssl-dev \
-          python3 \
-          python3-pip \
-          python3-pyelftools \
-          rsync \
-          unzip \
-          wget \
-          zlib1g-dev \
-          file \
-          ccache \
-          device-tree-compiler \
-          patch \
-          bc \
-          jq \
-          xz-utils \
-          zstd
-
-
-        sudo timedatectl set-timezone "${TZ}"
-
-
-
-    #################################################
-    # Clone OpenWrt source
-    #################################################
-
-    - name: Clone Ruijie OpenWrt source
-
-      run: |
-
-        git clone \
-          --depth=1 \
-          --branch "${OPENWRT_BRANCH}" \
-          "${OPENWRT_REPO}" \
-          "${OPENWRT_DIR}"
-
-
-        cd "${OPENWRT_DIR}"
-
-
-        echo "Commit:"
-        git rev-parse HEAD
-
-
-
-
-    #################################################
-    # Apply HNAT patch
-    #################################################
-
-    - name: Apply HNAT NF_NAT patch
-
-      run: |
-
-        chmod +x scripts/apply-hnat-patch.sh
-
-
-        ./scripts/apply-hnat-patch.sh
-
-
-
-
-    #################################################
-    # Feeds
-    #################################################
-
-    - name: Update feeds
-
-      working-directory: openwrt
-
-      run: |
-
-        ./scripts/feeds update -a
-
-        ./scripts/feeds install -a
-
-
-
-
-    #################################################
-    # Apply config
-    #################################################
-
-    - name: Apply RG-X60 config
-
-      working-directory: openwrt
-
-      run: |
-
-        cp \
-          ../defconfig/x60.config \
-          .config
-
-
-        make defconfig
-
-
-        cp .config ../x60-final.config
-
-
-
-
-    #################################################
-    # Verify OpenWrt config
-    #################################################
-
-    - name: Verify OpenWrt config
-
-      run: |
-
-        chmod +x scripts/verify-config.sh
-
-
-        ./scripts/verify-config.sh \
-          openwrt/.config
-
-
-
-
-    #################################################
-    # Prepare kernel
-    #################################################
-
-    - name: Prepare kernel source
-
-      working-directory: openwrt
-
-      run: |
-
-        make target/linux/prepare V=s
-
-
-
-
-    #################################################
-    # Verify kernel BPF/BTF
-    #################################################
-
-    - name: Verify kernel BPF BTF
-
-      run: |
-
-        chmod +x scripts/verify-kernel-bpf.sh
-
-
-        ./scripts/verify-kernel-bpf.sh openwrt
-
-
-
-
-    #################################################
-    # ccache
-    #################################################
-
-    - name: Restore ccache
-
-      if: ${{ github.event.inputs.clean_build != 'true' }}
-
-      uses: actions/cache@v4
-
-      with:
-
-        path: ~/.ccache
-
-        key: rg-x60-${{ runner.os }}-${{ hashFiles('defconfig/x60.config') }}
-
-        restore-keys:
-
-          rg-x60-${{ runner.os }}-
-
-
-
-
-    - name: Configure ccache
-
-      run: |
-
-        mkdir -p ~/.ccache
-
-
-        ccache \
-          --set-config=max_size=8G
-
-
-        ccache \
-          --set-config=compression=true
-
-
-        ccache -z
-
-
-
-
-    #################################################
-    # Download
-    #################################################
-
-    - name: Download packages
-
-      working-directory: openwrt
-
-      run: |
-
-        set -o pipefail
-
-
-        make download \
-          -j8 \
-          V=s \
-          2>&1 | tee ../download-parallel.log || true
-
-
-        find dl \
-          -type f \
-          -size -1024c \
-          -delete
-
-
-        make download \
-          -j1 \
-          V=s \
-          2>&1 | tee ../download-single.log
-
-
-
-
-    #################################################
-    # Build
-    #################################################
-
-    - name: Compile firmware
-
-      working-directory: openwrt
-
-      run: |
-
-        set -o pipefail
-
-
-        make \
-          -j$(nproc) \
-          V=s \
-          2>&1 | tee ../build.log
-
-
-
-
-    #################################################
-    # Check image
-    #################################################
-
-    - name: Check firmware output
-
-      working-directory: openwrt
-
-      run: |
-
-        set -euo pipefail
-
-
-        mkdir -p ../firmware
-
-
-
-        mapfile -t images < <(
-
-          find \
-          bin/targets/mediatek/filogic \
-          -maxdepth 1 \
-          -type f \
-          -name "*${DEVICE_NAME}*sysupgrade.bin"
-
-        )
-
-
-
-        echo "Found images:"
-
-        printf '%s\n' "${images[@]}"
-
-
-
-        if [ "${#images[@]}" -ne 1 ]
-
-        then
-
-          echo "ERROR: Expected exactly one sysupgrade image"
-
-          exit 1
-
-        fi
-
-
-
-        cp \
-          "${images[0]}" \
-          ../firmware/
-
-
-        cp \
-          .config \
-          ../firmware/x60-final.config
-
-
-
-        sha256sum \
-          ../firmware/*.bin \
-          > ../firmware/SHA256SUMS
-
-
-
-
-    #################################################
-    # Upload
-    #################################################
-
-    - name: Upload firmware
-
-      uses: actions/upload-artifact@v4
-
-      with:
-
-        name: RG-X60-firmware
-
-        path: firmware/
-
-        retention-days: 30
-
-
-
-
-    #################################################
-    # Failure logs
-    #################################################
-
-    - name: Upload failure logs
-
-      if: failure()
-
-      uses: actions/upload-artifact@v4
-
-      with:
-
-        name: RG-X60-build-failure-logs
-
-        path: |
-
-          build.log
-
-          download-parallel.log
-
-          download-single.log
-
-          x60-final.config
-
-          openwrt/.config
-
-        retention-days: 7
+      - name: Checkout build files
+        uses: actions/checkout@v4
+
+      - name: Validate local files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f "${CONFIG_FILE}" || {
+            echo "ERROR: ${CONFIG_FILE} 不存在"
+            exit 1
+          }
+
+          echo "使用配置文件：${CONFIG_FILE}"
+          sha256sum "${CONFIG_FILE}"
+
+      - name: Free disk space
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+
+          sudo docker system prune --all --force || true
+
+          echo "磁盘空间："
+          df -h
+
+      - name: Install dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+
+          sudo apt-get install -y --no-install-recommends \
+            ack \
+            antlr3 \
+            asciidoc \
+            autoconf \
+            automake \
+            autopoint \
+            binutils \
+            bison \
+            build-essential \
+            bzip2 \
+            ccache \
+            clang \
+            cmake \
+            cpio \
+            curl \
+            device-tree-compiler \
+            flex \
+            gawk \
+            genisoimage \
+            gettext \
+            gcc-multilib \
+            g++-multilib \
+            git \
+            gperf \
+            help2man \
+            intltool \
+            lib32gcc-s1 \
+            libc6-dev-i386 \
+            libelf-dev \
+            libglib2.0-dev \
+            libgmp3-dev \
+            libltdl-dev \
+            libmpc-dev \
+            libmpfr-dev \
+            libncurses-dev \
+            libpython3-dev \
+            libreadline-dev \
+            libssl-dev \
+            libtool \
+            libyaml-dev \
+            libz-dev \
+            lld \
+            llvm \
+            lrzsz \
+            msmtp \
+            nano \
+            ninja-build \
+            p7zip-full \
+            patch \
+            pkgconf \
+            python3 \
+            python3-docutils \
+            python3-pip \
+            python3-ply \
+            python3-pyelftools \
+            qemu-utils \
+            re2c \
+            rsync \
+            scons \
+            squashfs-tools \
+            subversion \
+            swig \
+            texinfo \
+            uglifyjs \
+            unzip \
+            vim \
+            wget \
+            xmlto \
+            xxd \
+            zlib1g-dev \
+            zstd
+
+          sudo apt-get clean
+
+      - name: Clone Ruijie OpenWrt source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git clone \
+            --filter=blob:none \
+            --single-branch \
+            --branch "${OPENWRT_BRANCH}" \
+            "${OPENWRT_REPO}" \
+            "${OPENWRT_DIR}"
+
+          cd "${OPENWRT_DIR}"
+
+          echo "SOURCE_COMMIT=$(git rev-parse HEAD)" >> "${GITHUB_ENV}"
+          echo "SOURCE_SHORT_SHA=$(git rev-parse --short=8 HEAD)" >> "${GITHUB_ENV}"
+          echo "BUILD_DATE=$(date +'%Y.%m.%d')" >> "${GITHUB_ENV}"
+          echo "BUILD_ID=$(date +'%Y%m%d-%H%M')" >> "${GITHUB_ENV}"
+
+          echo "源码分支：$(git branch --show-current)"
+          echo "源码提交：$(git rev-parse HEAD)"
+          git log -1 --oneline
+
+      - name: Fix HNAT dependency to generic NF_NAT
+        working-directory: ${{ env.OPENWRT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PATCH_ROOT="target/linux/mediatek/patches-6.6"
+
+          OLD_DEP='depends on NET_MEDIATEK_SOC && NF_CONNTRACK && IP_NF_NAT'
+          NEW_DEP='depends on NET_MEDIATEK_SOC && NF_CONNTRACK && NF_NAT'
+
+          test -d "${PATCH_ROOT}" || {
+            echo "ERROR: ${PATCH_ROOT} 不存在"
+            exit 1
+          }
+
+          mapfile -t OLD_FILES < <(
+            grep -RIl \
+              --include='*.patch' \
+              -F "${OLD_DEP}" \
+              "${PATCH_ROOT}" || true
+          )
+
+          mapfile -t NEW_FILES_BEFORE < <(
+            grep -RIl \
+              --include='*.patch' \
+              -F "${NEW_DEP}" \
+              "${PATCH_ROOT}" || true
+          )
+
+          echo "旧依赖匹配文件数：${#OLD_FILES[@]}"
+          printf '%s\n' "${OLD_FILES[@]:-}"
+
+          echo "已修正依赖匹配文件数：${#NEW_FILES_BEFORE[@]}"
+          printf '%s\n' "${NEW_FILES_BEFORE[@]:-}"
+
+          if (( ${#OLD_FILES[@]} == 1 )); then
+            TARGET_PATCH="${OLD_FILES[0]}"
+
+            echo "修改上游补丁：${TARGET_PATCH}"
+
+            python3 - "${TARGET_PATCH}" "${OLD_DEP}" "${NEW_DEP}" <<'PY'
+          from pathlib import Path
+          import sys
+
+          path = Path(sys.argv[1])
+          old = sys.argv[2]
+          new = sys.argv[3]
+
+          text = path.read_text(encoding="utf-8")
+          count = text.count(old)
+
+          if count != 1:
+              raise SystemExit(
+                  f"ERROR: expected exactly one dependency occurrence, found {count}"
+              )
+
+          path.write_text(text.replace(old, new, 1), encoding="utf-8")
+          PY
+
+          elif (( ${#OLD_FILES[@]} == 0 && ${#NEW_FILES_BEFORE[@]} >= 1 )); then
+            echo "HNAT 补丁已经使用通用 NF_NAT，无需重复修改。"
+
+          else
+            echo "ERROR: HNAT 依赖匹配数量异常。"
+            echo "预期：旧依赖恰好 1 处，或者旧依赖 0 处且新依赖已经存在。"
+
+            grep -Rns \
+              --include='*.patch' \
+              -E 'NET_MEDIATEK_SOC.*NF_CONNTRACK.*(IP_NF_NAT|NF_NAT)' \
+              "${PATCH_ROOT}" || true
+
+            exit 1
+          fi
+
+          if grep -Rqs \
+            --include='*.patch' \
+            -F "${OLD_DEP}" \
+            "${PATCH_ROOT}"
+          then
+            echo "ERROR: 修改后仍存在 IP_NF_NAT 强依赖。"
+
+            grep -Rns \
+              --include='*.patch' \
+              -F "${OLD_DEP}" \
+              "${PATCH_ROOT}" || true
+
+            exit 1
+          fi
+
+          mapfile -t NEW_FILES_AFTER < <(
+            grep -RIl \
+              --include='*.patch' \
+              -F "${NEW_DEP}" \
+              "${PATCH_ROOT}" || true
+          )
+
+          if (( ${#NEW_FILES_AFTER[@]} == 0 )); then
+            echo "ERROR: 修改后没有找到通用 NF_NAT 依赖。"
+            exit 1
+          fi
+
+          echo "HNAT 依赖最终状态："
+
+          grep -Rns \
+            --include='*.patch' \
+            -F "${NEW_DEP}" \
+            "${PATCH_ROOT}"
+
+      - name: Update and install feeds
+        working-directory: ${{ env.OPENWRT_DIR }}
+        shell: bash
+        run: |
+          set -o pipefail
+
+          ./scripts/feeds update -a \
+            2>&1 | tee ../feeds-update.log
+
+          ./scripts/feeds install -a \
+            2>&1 | tee ../feeds-install.log
+
+      - name: Restore ccache
+        if: ${{ inputs.clean_build == false }}
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: >-
+            rg-x60-${{ runner.os }}-${{
+            hashFiles('defconfig/x60.config',
+            '.github/workflows/build-x60.yml') }}
+          restore-keys: |
+            rg-x60-${{ runner.os }}-
+
+      - name: Configure ccache
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "${CCACHE_DIR}"
+
+          ccache --set-config=cache_dir="${CCACHE_DIR}"
+          ccache --set-config=max_size=5G
+          ccache --set-config=compression=true
+          ccache --zero-stats
+
+          ccache --show-config
+
+      - name: Apply RG-X60 configuration
+        working-directory: ${{ env.OPENWRT_DIR }}
+        shell: bash
+        run: |
+          set -o pipefail
+
+          cp "../${CONFIG_FILE}" .config
+
+          make defconfig \
+            2>&1 | tee ../defconfig.log
+
+          cp .config ../x60-final.config
+
+      - name: Verify OpenWrt configuration
+        working-directory: ${{ env.OPENWRT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          require_y() {
+            local symbol="$1"
+
+            if grep -qx "${symbol}=y" .config; then
+              echo "OK: ${symbol}=y"
+            else
+              echo "ERROR: ${symbol}=y 未生效"
+              grep -E "^${symbol}(=| )" .config || true
+              exit 1
+            fi
+          }
+
+          require_not_enabled() {
+            local symbol="$1"
+
+            if grep -qE "^${symbol}=(y|m)$" .config; then
+              echo "ERROR: ${symbol} 不应启用"
+              grep -E "^${symbol}=(y|m)$" .config
+              exit 1
+            else
+              echo "OK: ${symbol} 未启用"
+            fi
+          }
+
+          echo "===== 目标设备 ====="
+
+          require_y "${DEVICE_CONFIG}"
+
+          OTHER_TARGETS="$(
+            grep -E \
+              '^CONFIG_TARGET(_DEVICE)?_mediatek_filogic_DEVICE_.*=y$' \
+              .config |
+            grep -v -F "${DEVICE_CONFIG}=y" || true
+          )"
+
+          if [[ -n "${OTHER_TARGETS}" ]]; then
+            echo "ERROR: 检测到其他设备 Profile："
+            echo "${OTHER_TARGETS}"
+            exit 1
+          fi
+
+          echo "OK: 只编译普通 RG-X60"
+
+          echo
+          echo "===== HNAT / firewall4 ====="
+
+          require_y CONFIG_PACKAGE_kmod-mediatek_hnat
+          require_y CONFIG_PACKAGE_firewall4
+
+          echo
+          echo "===== dae 所需 eBPF/BTF 内核配置 ====="
+
+          REQUIRED_BPF_OPTIONS=(
+            CONFIG_KERNEL_CGROUPS
+            CONFIG_KERNEL_KPROBES
+            CONFIG_KERNEL_KPROBE_EVENTS
+            CONFIG_KERNEL_BPF_EVENTS
+            CONFIG_KERNEL_BPF_STREAM_PARSER
+            CONFIG_KERNEL_DEBUG_INFO
+            CONFIG_KERNEL_DEBUG_INFO_BTF
+            CONFIG_KERNEL_DEBUG_INFO_BTF_MODULES
+            CONFIG_KERNEL_XDP_SOCKETS
+            CONFIG_PACKAGE_kmod-xdp-sockets-diag
+          )
+
+          for option in "${REQUIRED_BPF_OPTIONS[@]}"; do
+            require_y "${option}"
+          done
+
+          if ! grep -qx \
+            '# CONFIG_KERNEL_DEBUG_INFO_REDUCED is not set' \
+            .config
+          then
+            echo "ERROR: CONFIG_KERNEL_DEBUG_INFO_REDUCED 必须关闭"
+            grep -E 'CONFIG_KERNEL_DEBUG_INFO_REDUCED' .config || true
+            exit 1
+          fi
+
+          echo "OK: CONFIG_KERNEL_DEBUG_INFO_REDUCED 已关闭"
+
+          echo
+          echo "===== 不内置 dae ====="
+
+          require_not_enabled CONFIG_PACKAGE_dae
+          require_not_enabled CONFIG_PACKAGE_daed
+
+          echo
+          echo "===== 删除不需要的应用 ====="
+
+          UNWANTED_APPS=(
+            CONFIG_PACKAGE_luci-app-passwall
+            CONFIG_PACKAGE_luci-app-ssr-plus
+            CONFIG_PACKAGE_luci-app-vssr
+            CONFIG_PACKAGE_luci-app-rclone
+            CONFIG_PACKAGE_luci-app-eqos
+            CONFIG_PACKAGE_luci-app-eqos-mtk
+            CONFIG_PACKAGE_luci-app-upnp
+            CONFIG_PACKAGE_miniupnpd
+            CONFIG_PACKAGE_miniupnpd-nftables
+          )
+
+          for option in "${UNWANTED_APPS[@]}"; do
+            require_not_enabled "${option}"
+          done
+
+          echo
+          echo "===== 删除 legacy iptables/ipset/ebtables ====="
+
+          LEGACY_REGEX='^CONFIG_PACKAGE_(iptables($|-)|ip6tables($|-)|iptables-mod-|kmod-ipt-|kmod-ip6tables|ipset$|libipset$|libiptext|libxtables$|xtables-nft$|ebtables($|-)|kmod-ebtables|kmod-nft-compat$).*=(y|m)$'
+
+          if grep -qE "${LEGACY_REGEX}" .config; then
+            echo "ERROR: 最终配置仍然包含 legacy/compat 防火墙组件："
+            grep -E "${LEGACY_REGEX}" .config
+            exit 1
+          fi
+
+          echo "OK: 未检测到 legacy iptables/ipset/ebtables"
+
+          echo
+          echo "===== 最终设备配置 ====="
+
+          grep -E \
+            '^CONFIG_TARGET(_DEVICE)?_mediatek_filogic_DEVICE_.*=y$' \
+            .config
+
+      - name: Download package sources
+        working-directory: ${{ env.OPENWRT_DIR }}
+        shell: bash
+        run: |
+          set -o pipefail
+
+          make download -j8 V=s \
+            2>&1 | tee ../download-parallel.log || true
+
+          find dl \
+            -type f \
+            -size -1024c \
+            -print \
+            -delete || true
+
+          make download -j1 V=s \
+            2>&1 | tee ../download-single.log
+
+      - name: Prepare kernel
+        working-directory: ${{ env.OPENWRT_DIR }}
+        shell: bash
+        run: |
+          set -o pipefail
+
+          make target/linux/prepare \
+            -j"$(nproc)" \
+            V=s \
+            2>&1 | tee ../kernel-prepare.log
+
+      - name: Verify generated Linux kernel configuration
+        working-directory: ${{ env.OPENWRT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mapfile -t KERNEL_CONFIGS < <(
+            find build_dir \
+              -type f \
+              -path '*/linux-mediatek_filogic/linux-6.6*/.config' \
+              -print
+          )
+
+          echo "找到的内核配置："
+          printf '%s\n' "${KERNEL_CONFIGS[@]:-}"
+
+          if (( ${#KERNEL_CONFIGS[@]} != 1 )); then
+            echo "ERROR: 预期恰好找到一个 Filogic Linux 6.6 内核配置，实际为 ${#KERNEL_CONFIGS[@]}"
+
+            find build_dir \
+              -type f \
+              -path '*/linux*/.config' \
+              -print || true
+
+            exit 1
+          fi
+
+          KERNEL_CONFIG="${KERNEL_CONFIGS[0]}"
+
+          require_kernel_y() {
+            local symbol="$1"
+
+            if grep -qx "${symbol}=y" "${KERNEL_CONFIG}"; then
+              echo "OK: ${symbol}=y"
+            else
+              echo "ERROR: 最终 Linux 内核缺少 ${symbol}=y"
+              grep -E "^${symbol}(=| )" "${KERNEL_CONFIG}" || true
+              exit 1
+            fi
+          }
+
+          REQUIRED_KERNEL_OPTIONS=(
+            CONFIG_CGROUPS
+            CONFIG_KPROBES
+            CONFIG_KPROBE_EVENTS
+            CONFIG_BPF_EVENTS
+            CONFIG_BPF_STREAM_PARSER
+            CONFIG_DEBUG_INFO
+            CONFIG_DEBUG_INFO_BTF
+            CONFIG_DEBUG_INFO_BTF_MODULES
+            CONFIG_XDP_SOCKETS
+          )
+
+          for option in "${REQUIRED_KERNEL_OPTIONS[@]}"; do
+            require_kernel_y "${option}"
+          done
+
+          cp "${KERNEL_CONFIG}" ../kernel-rg-x60.config
+
+          echo
+          echo "Linux 内核 eBPF/BTF 配置校验通过。"
+
+      - name: Build firmware
+        working-directory: ${{ env.OPENWRT_DIR }}
+        shell: bash
+        run: |
+          set -o pipefail
+
+          if ! make -j"$(nproc)" V=s \
+            2>&1 | tee ../build-parallel.log
+          then
+            echo "并行编译失败，使用单线程重试以获得明确错误日志。"
+
+            make -j1 V=s \
+              2>&1 | tee ../build-single.log
+          fi
+
+      - name: Verify built kernel contains BTF
+        working-directory: ${{ env.OPENWRT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mapfile -t VMLINUX_FILES < <(
+            find build_dir \
+              -type f \
+              -path '*/linux-mediatek_filogic/linux-6.6*/vmlinux' \
+              -print
+          )
+
+          echo "找到的 vmlinux："
+          printf '%s\n' "${VMLINUX_FILES[@]:-}"
+
+          if (( ${#VMLINUX_FILES[@]} != 1 )); then
+            echo "ERROR: 预期恰好找到一个 Filogic vmlinux，实际为 ${#VMLINUX_FILES[@]}"
+            exit 1
+          fi
+
+          VMLINUX="${VMLINUX_FILES[0]}"
+
+          if ! readelf --sections --wide "${VMLINUX}" |
+            grep -qE '[[:space:]]\.BTF[[:space:]]'
+          then
+            echo "ERROR: vmlinux 中没有找到 .BTF section"
+            exit 1
+          fi
+
+          echo "OK: vmlinux 包含 .BTF section"
+
+          readelf --sections --wide "${VMLINUX}" |
+            grep -E '[[:space:]]\.BTF(_ids)?[[:space:]]' || true
+
+      - name: Collect and verify firmware
+        working-directory: ${{ env.OPENWRT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -d "${OUTPUT_DIR}" || {
+            echo "ERROR: ${OUTPUT_DIR} 不存在"
+            exit 1
+          }
+
+          mapfile -t IMAGES < <(
+            find "${OUTPUT_DIR}" \
+              -maxdepth 1 \
+              -type f \
+              -name "*${DEVICE_NAME}*squashfs-sysupgrade.bin" \
+              -print
+          )
+
+          echo "找到的 RG-X60 sysupgrade 固件："
+          printf '%s\n' "${IMAGES[@]:-}"
+
+          if (( ${#IMAGES[@]} != 1 )); then
+            echo "ERROR: 预期恰好生成一个普通 RG-X60 sysupgrade.bin，实际为 ${#IMAGES[@]}"
+
+            echo "Filogic 输出目录："
+            find "${OUTPUT_DIR}" \
+              -maxdepth 1 \
+              -type f \
+              -printf '%f\n' |
+              sort
+
+            exit 1
+          fi
+
+          mkdir -p ../firmware
+
+          ORIGINAL_IMAGE="${IMAGES[0]}"
+          FINAL_IMAGE="../firmware/RG-X60-${BUILD_DATE}-${SOURCE_SHORT_SHA}-sysupgrade.bin"
+
+          cp "${ORIGINAL_IMAGE}" "${FINAL_IMAGE}"
+          cp ../x60-final.config ../firmware/
+          cp ../kernel-rg-x60.config ../firmware/
+
+          if [[ -f "${OUTPUT_DIR}/profiles.json" ]]; then
+            cp "${OUTPUT_DIR}/profiles.json" ../firmware/
+          fi
+
+          if [[ -f "${OUTPUT_DIR}/sha256sums" ]]; then
+            cp "${OUTPUT_DIR}/sha256sums" ../firmware/upstream-sha256sums
+          fi
+
+          (
+            cd ../firmware
+            sha256sum *.bin > SHA256SUMS
+          )
+
+          echo "最终产物："
+          ls -lh ../firmware
+
+      - name: Show ccache statistics
+        if: always()
+        shell: bash
+        run: |
+          ccache --show-stats || true
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: >-
+            RG-X60-${{ env.BUILD_ID }}-${{
+            env.SOURCE_SHORT_SHA }}
+          path: firmware/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: RG-X60-failure-logs-${{ github.run_number }}
+          path: |
+            *.log
+            x60-final.config
+            kernel-rg-x60.config
+            openwrt/.config
+            openwrt/logs/
+          if-no-files-found: ignore
+          retention-days: 7
