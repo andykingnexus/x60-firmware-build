@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       clean_build:
-        description: "忽略 ccache，执行干净编译（dl 下载缓存仍会恢复）"
+        description: "忽略 ccache，执行干净编译"
         required: true
         default: false
         type: boolean
@@ -30,6 +30,7 @@ env:
   DEVICE_NAME: ruijie-rg-x60
   OUTPUT_DIR: bin/targets/mediatek/filogic
   CCACHE_DIR: ${{ github.workspace }}/.ccache
+  SOURCE_MIRROR: https://sources.immortalwrt.org
 
 jobs:
   build:
@@ -285,91 +286,36 @@ jobs:
           ./scripts/feeds install -a \
             2>&1 | tee ../feeds-install.log
 
-      - name: Replace unstable kernel.org mirrors
+      - name: Apply x60.config and set source mirror
         working-directory: ${{ env.OPENWRT_DIR }}
         shell: bash
         run: |
           set -euo pipefail
-
-          python3 <<'PY'
-          from pathlib import Path
-
-          replacements = {
-              "https://mirrors.ustc.edu.cn/kernel.org":
-                  "https://mirrors.edge.kernel.org/pub",
-              "https://mirror.nju.edu.cn/kernel.org":
-                  "https://cdn.kernel.org/pub",
-          }
-
-          roots = [
-              Path("include"),
-              Path("scripts"),
-              Path("package"),
-              Path("target"),
-              Path("toolchain"),
-              Path("tools"),
-              Path("feeds"),
-          ]
-
-          changed = []
-
-          for root in roots:
-              if not root.exists():
-                  continue
-
-              for path in root.rglob("*"):
-                  if not path.is_file():
-                      continue
-
-                  try:
-                      text = path.read_text(
-                          encoding="utf-8",
-                          errors="strict",
-                      )
-                  except (UnicodeDecodeError, OSError):
-                      continue
-
-                  updated = text
-
-                  for old, new in replacements.items():
-                      updated = updated.replace(old, new)
-
-                  if updated != text:
-                      path.write_text(
-                          updated,
-                          encoding="utf-8",
-                      )
-                      changed.append(path)
-
-          if changed:
-              print("已替换不稳定镜像：")
-              for path in changed:
-                  print(f"  {path}")
-          else:
-              print("源码中未发现 USTC/NJU kernel.org 镜像，无需修改。")
-          PY
-
-          if grep -Rqs \
-            --exclude-dir=.git \
-            -E 'https://(mirrors\.ustc\.edu\.cn|mirror\.nju\.edu\.cn)/kernel\.org' \
-            include scripts package target toolchain tools feeds 2>/dev/null
-          then
-            echo "ERROR: 仍存在不稳定的 kernel.org 镜像"
-            exit 1
-          fi
-
-      - name: Apply x60.config
-        working-directory: ${{ env.OPENWRT_DIR }}
-        shell: bash
-        run: |
           set -o pipefail
 
           cp "../${CONFIG_FILE}" .config
+
+          sed -i \
+            -e '/^CONFIG_LOCALMIRROR=/d' \
+            -e '/^# CONFIG_LOCALMIRROR is not set$/d' \
+            .config
+
+          printf 'CONFIG_LOCALMIRROR="%s"\n' \
+            "${SOURCE_MIRROR}" >> .config
 
           make defconfig \
             2>&1 | tee ../defconfig.log
 
           cp .config ../x60-final.config
+
+          grep -qx \
+            "CONFIG_LOCALMIRROR=\"${SOURCE_MIRROR}\"" \
+            .config || {
+              echo "ERROR: LOCALMIRROR 未生效"
+              exit 1
+            }
+
+          echo "优先源码镜像：${SOURCE_MIRROR}"
 
       - name: Verify OpenWrt configuration
         working-directory: ${{ env.OPENWRT_DIR }}
@@ -534,8 +480,6 @@ jobs:
               "CONFIG_PACKAGE_kmod-nf-ipt",
           }
 
-          forbidden = []
-
           patterns = (
               re.compile(r"CONFIG_PACKAGE_iptables(?:-.*)?$"),
               re.compile(r"CONFIG_PACKAGE_ip6tables(?:-.*)?$"),
@@ -554,6 +498,7 @@ jobs:
           )
 
           compat = []
+          forbidden = []
 
           for symbol, value in sorted(enabled.items()):
               if not any(
@@ -575,9 +520,7 @@ jobs:
                   print(f"  {entry}")
 
           if forbidden:
-              print(
-                  "ERROR: 仍有不允许的 legacy/compat 组件："
-              )
+              print("ERROR: 仍有不允许的 legacy/compat 组件：")
               for entry in forbidden:
                   print(f"  {entry}")
               raise SystemExit(1)
@@ -601,8 +544,7 @@ jobs:
 
           mkdir -p dl
 
-          if ! timeout --kill-after=30s 30m \
-            make download -j8 V=s \
+          if ! CCACHE_DISABLE=1 make download -j8 V=s \
             2>&1 | tee ../download-parallel.log
           then
             echo "并行下载未完成，清理异常小文件后降低并发重试。"
@@ -613,8 +555,7 @@ jobs:
               -print \
               -delete || true
 
-            timeout --kill-after=30s 20m \
-              make download -j2 V=s \
+            CCACHE_DISABLE=1 make download -j2 V=s \
               2>&1 | tee ../download-retry.log
           fi
 
@@ -622,7 +563,9 @@ jobs:
           du -sh dl
 
       - name: Save download cache
-        if: ${{ steps.dl-cache.outputs.cache-hit != 'true' }}
+        if: >-
+          ${{ success() &&
+          steps.dl-cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
         with:
           path: openwrt/dl
@@ -696,7 +639,7 @@ jobs:
             find "${OUTPUT_DIR}" \
               -maxdepth 1 \
               -type f \
-              -name "*-${DEVICE_NAME}-squashfs-sysupgrade.bin" \
+              -name "*${DEVICE_NAME}*squashfs-sysupgrade.bin" \
               -print
           )
 
