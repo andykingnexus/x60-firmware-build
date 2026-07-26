@@ -3,9 +3,7 @@
 set -euo pipefail
 
 
-
 OPENWRT_DIR="${1:-openwrt}"
-
 
 
 KERNEL_CONFIG=$(find \
@@ -16,10 +14,9 @@ KERNEL_CONFIG=$(find \
 
 
 
-if [ -z "${KERNEL_CONFIG}" ]
-then
+if [ -z "${KERNEL_CONFIG}" ]; then
 
-    echo "ERROR: kernel .config not found"
+    echo "ERROR: Linux kernel .config not found"
 
     exit 1
 
@@ -27,7 +24,7 @@ fi
 
 
 
-echo "Kernel config:"
+echo "Using kernel config:"
 echo "${KERNEL_CONFIG}"
 
 echo
@@ -36,28 +33,20 @@ echo
 
 check_kernel()
 {
+    local option="$1"
 
-    local item="$1"
-
-
-    if grep -qx "${item}=y" "${KERNEL_CONFIG}"
+    if grep -qx "${option}=y" "${KERNEL_CONFIG}"
     then
-
-        echo "OK   ${item}"
-
+        echo "OK   ${option}"
     else
-
-        echo "FAIL ${item}"
-
+        echo "FAIL ${option}"
         exit 1
-
     fi
-
 }
 
 
 
-echo "===== Linux eBPF/BTF ====="
+echo "===== Required Linux eBPF/BTF ====="
 
 
 check_kernel CONFIG_BPF
@@ -68,13 +57,19 @@ check_kernel CONFIG_BPF_JIT
 
 check_kernel CONFIG_BTF
 
+check_kernel CONFIG_DEBUG_INFO
+
 check_kernel CONFIG_DEBUG_INFO_BTF
+
+check_kernel CONFIG_DEBUG_INFO_BTF_MODULES
 
 check_kernel CONFIG_KPROBES
 
 check_kernel CONFIG_KPROBE_EVENTS
 
 check_kernel CONFIG_BPF_EVENTS
+
+check_kernel CONFIG_CGROUPS
 
 check_kernel CONFIG_CGROUP_BPF
 
