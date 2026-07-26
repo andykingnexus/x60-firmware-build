@@ -3,136 +3,442 @@ name: Build Ruijie RG-X60 Firmware
 on:
   workflow_dispatch:
     inputs:
-      ssh_debug:
-        description: "编译前是否开启 tmate SSH 调试"
+      clean_build:
+        description: "Clean build cache"
         required: false
-        default: "false"
-  push:
-    branches: ["main"]
-    paths:
-      - "defconfig/x60.config"
-      - "patches/**"
-      - ".github/workflows/build-x60.yml"
+        default: false
+        type: boolean
 
 env:
-  # 上游源码：Ruijie 官方社区仓库
-  REPO_URL: https://github.com/RuijieNetworksCommunity/MT798X-6.6-24.10
-  REPO_BRANCH: openwrt-24.10-6.6
-  BUILD_DIR: openwrt
-  DEVICE_TARGET: ruijie-rg-x60
-  CONFIG_FILE: x60.config
-  TZ: Asia/Seoul
+  OPENWRT_REPO: https://github.com/RuijieNetworksCommunity/MT798X-6.6-24.10
+  OPENWRT_BRANCH: openwrt-24.10-6.6
+
+  OPENWRT_DIR: openwrt
+
+  DEVICE_NAME: ruijie-rg-x60
+
+  TZ: Asia/Shanghai
+
 
 jobs:
+
   build:
+
     runs-on: ubuntu-24.04
+
+    timeout-minutes: 360
+
+
     steps:
-      - name: 检出本仓库（defconfig / patches）
-        uses: actions/checkout@v4
 
-      - name: 释放磁盘空间
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: false
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: false
-          swap-storage: false
 
-      - name: 初始化编译环境
-        env:
-          DEBIAN_FRONTEND: noninteractive
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ack antlr3 asciidoc autoconf automake autopoint binutils bison \
-            build-essential bzip2 ccache clang cmake cpio curl device-tree-compiler ecj fastjar \
-            flex gawk gettext gcc-multilib g++-multilib git gnutls-dev gperf haveged help2man \
-            intltool lib32gcc-s1 libc6-dev-i386 libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev \
-            libmpc-dev libmpfr-dev libncurses-dev libpython3-dev libreadline-dev libssl-dev \
-            libtool libyaml-dev libz-dev lld llvm lrzsz mkisofs msmtp nano ninja-build p7zip \
-            p7zip-full patch pkgconf python3 python3-pip python3-ply python3-docutils \
-            python3-pyelftools qemu-utils re2c rsync scons squashfs-tools subversion swig \
-            texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev zstd
-          sudo timedatectl set-timezone "$TZ"
+    #################################################
+    # Checkout build repository
+    #################################################
 
-      - name: 克隆 Ruijie 官方源码
-        run: |
-          git clone --filter=blob:none -b $REPO_BRANCH $REPO_URL $BUILD_DIR
-          cd $BUILD_DIR
-          echo "HEAD: $(git rev-parse HEAD)"
+    - name: Checkout build files
+      uses: actions/checkout@v4
 
-      - name: 应用 HNAT NF_NAT 内核补丁（解除 legacy iptables 强依赖）
-        run: |
-          cp patches/zzz-999-mtkhnat-use-generic-nf-nat-dependency.patch \
-             $BUILD_DIR/target/linux/mediatek/patches-6.6/
-          echo "补丁已放入 target/linux/mediatek/patches-6.6/，将在内核解包时自动应用"
 
-      - name: 更新 & 安装 feeds
-        working-directory: ${{ env.BUILD_DIR }}
-        run: |
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
 
-      - name: 写入自定义 defconfig
-        working-directory: ${{ env.BUILD_DIR }}
-        run: |
-          cp ../defconfig/$CONFIG_FILE .config
-          make defconfig
+    #################################################
+    # Free disk
+    #################################################
 
-      - name: 校验配置是否被 Kconfig 依赖关系丢弃
-        working-directory: ${{ env.BUILD_DIR }}
-        run: |
-          echo "--- 校验 eBPF/BTF 相关选项是否生效 ---"
-          for sym in KERNEL_DEBUG_INFO_BTF KERNEL_BPF_EVENTS KERNEL_CGROUP_BPF KERNEL_XDP_SOCKETS KERNEL_BPF_STREAM_PARSER KERNEL_NETKIT; do
-            if grep -q "^CONFIG_${sym}=y" .config; then
-              echo "OK  : CONFIG_${sym}=y"
-            else
-              echo "WARN: CONFIG_${sym} 未生效，检查依赖链（可能被 SMALL_FLASH / DEBUG_INFO_REDUCED 等条件挡住）"
-            fi
-          done
-          echo "--- 校验目标设备 ---"
-          grep "CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_${DEVICE_TARGET}" .config || \
-            (echo "错误：目标设备未出现在 .config 中" && exit 1)
+    - name: Free disk space
 
-      - name: 可选 SSH 调试（tmate）
-        if: ${{ github.event.inputs.ssh_debug == 'true' }}
-        uses: mxschmitt/action-tmate@v3
-        timeout-minutes: 60
+      run: |
 
-      - name: 下载编译所需软件包源码
-        working-directory: ${{ env.BUILD_DIR }}
-        run: make download -j8
+        sudo rm -rf /usr/local/lib/android
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /opt/ghc
 
-      - name: 编译固件
-        working-directory: ${{ env.BUILD_DIR }}
-        run: |
-          make -j$(nproc) V=s || make -j1 V=s
+        sudo docker system prune -af || true
 
-      - name: 整理产物
-        id: artifacts
-        working-directory: ${{ env.BUILD_DIR }}
-        run: |
-          mkdir -p ../firmware-out
-          find bin/targets/mediatek/filogic -maxdepth 1 \
-            \( -iname "*${DEVICE_TARGET}*sysupgrade.bin" -o -iname "*${DEVICE_TARGET}*factory.bin" \) \
-            -exec cp {} ../firmware-out/ \;
-          cp .config ../firmware-out/x60-full.config
-          ls -la ../firmware-out
+        df -h
 
-      - name: 上传固件产物
-        uses: actions/upload-artifact@v4
-        with:
-          name: ruijie-rg-x60-firmware-${{ github.run_number }}
-          path: firmware-out/
-          retention-days: 14
 
-      - name: 上传编译日志（失败时）
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-logs-${{ github.run_number }}
-          path: |
-            ${{ env.BUILD_DIR }}/logs/
-            ${{ env.BUILD_DIR }}/.config
-          retention-days: 7
+
+    #################################################
+    # Dependencies
+    #################################################
+
+    - name: Install dependencies
+
+      env:
+        DEBIAN_FRONTEND: noninteractive
+
+      run: |
+
+        sudo apt update
+
+
+        sudo apt install -y \
+          build-essential \
+          clang \
+          flex \
+          bison \
+          gawk \
+          gcc-multilib \
+          g++-multilib \
+          gettext \
+          git \
+          libncurses-dev \
+          libssl-dev \
+          python3 \
+          python3-pip \
+          python3-pyelftools \
+          rsync \
+          unzip \
+          wget \
+          zlib1g-dev \
+          file \
+          ccache \
+          device-tree-compilter \
+          patch \
+          bc \
+          jq \
+          xz-utils \
+          zstd
+
+
+        sudo timedatectl set-timezone "${TZ}"
+
+
+
+    #################################################
+    # Clone OpenWrt source
+    #################################################
+
+    - name: Clone Ruijie OpenWrt source
+
+      run: |
+
+        git clone \
+          --depth=1 \
+          --branch "${OPENWRT_BRANCH}" \
+          "${OPENWRT_REPO}" \
+          "${OPENWRT_DIR}"
+
+
+        cd "${OPENWRT_DIR}"
+
+
+        echo "Commit:"
+        git rev-parse HEAD
+
+
+
+
+    #################################################
+    # Apply HNAT patch
+    #################################################
+
+    - name: Apply HNAT NF_NAT patch
+
+      run: |
+
+        chmod +x scripts/apply-hnat-patch.sh
+
+
+        ./scripts/apply-hnat-patch.sh
+
+
+
+
+    #################################################
+    # Feeds
+    #################################################
+
+    - name: Update feeds
+
+      working-directory: openwrt
+
+      run: |
+
+        ./scripts/feeds update -a
+
+        ./scripts/feeds install -a
+
+
+
+
+    #################################################
+    # Apply config
+    #################################################
+
+    - name: Apply RG-X60 config
+
+      working-directory: openwrt
+
+      run: |
+
+        cp \
+          ../defconfig/x60.config \
+          .config
+
+
+        make defconfig
+
+
+        cp .config ../x60-final.config
+
+
+
+
+    #################################################
+    # Verify OpenWrt config
+    #################################################
+
+    - name: Verify OpenWrt config
+
+      run: |
+
+        chmod +x scripts/verify-config.sh
+
+
+        ./scripts/verify-config.sh \
+          openwrt/.config
+
+
+
+
+    #################################################
+    # Prepare kernel
+    #################################################
+
+    - name: Prepare kernel source
+
+      working-directory: openwrt
+
+      run: |
+
+        make target/linux/prepare V=s
+
+
+
+
+    #################################################
+    # Verify kernel BPF/BTF
+    #################################################
+
+    - name: Verify kernel BPF BTF
+
+      run: |
+
+        chmod +x scripts/verify-kernel-bpf.sh
+
+
+        ./scripts/verify-kernel-bpf.sh openwrt
+
+
+
+
+    #################################################
+    # ccache
+    #################################################
+
+    - name: Restore ccache
+
+      if: ${{ github.event.inputs.clean_build != 'true' }}
+
+      uses: actions/cache@v4
+
+      with:
+
+        path: ~/.ccache
+
+        key: rg-x60-${{ runner.os }}-${{ hashFiles('defconfig/x60.config') }}
+
+        restore-keys:
+
+          rg-x60-${{ runner.os }}-
+
+
+
+
+    - name: Configure ccache
+
+      run: |
+
+        mkdir -p ~/.ccache
+
+
+        ccache \
+          --set-config=max_size=8G
+
+
+        ccache \
+          --set-config=compression=true
+
+
+        ccache -z
+
+
+
+
+    #################################################
+    # Download
+    #################################################
+
+    - name: Download packages
+
+      working-directory: openwrt
+
+      run: |
+
+        set -o pipefail
+
+
+        make download \
+          -j8 \
+          V=s \
+          2>&1 | tee ../download-parallel.log || true
+
+
+        find dl \
+          -type f \
+          -size -1024c \
+          -delete
+
+
+        make download \
+          -j1 \
+          V=s \
+          2>&1 | tee ../download-single.log
+
+
+
+
+    #################################################
+    # Build
+    #################################################
+
+    - name: Compile firmware
+
+      working-directory: openwrt
+
+      run: |
+
+        set -o pipefail
+
+
+        make \
+          -j$(nproc) \
+          V=s \
+          2>&1 | tee ../build.log
+
+
+
+
+    #################################################
+    # Check image
+    #################################################
+
+    - name: Check firmware output
+
+      working-directory: openwrt
+
+      run: |
+
+        set -euo pipefail
+
+
+        mkdir -p ../firmware
+
+
+
+        mapfile -t images < <(
+
+          find \
+          bin/targets/mediatek/filogic \
+          -maxdepth 1 \
+          -type f \
+          -name "*${DEVICE_NAME}*sysupgrade.bin"
+
+        )
+
+
+
+        echo "Found images:"
+
+        printf '%s\n' "${images[@]}"
+
+
+
+        if [ "${#images[@]}" -ne 1 ]
+
+        then
+
+          echo "ERROR: Expected exactly one sysupgrade image"
+
+          exit 1
+
+        fi
+
+
+
+        cp \
+          "${images[0]}" \
+          ../firmware/
+
+
+        cp \
+          .config \
+          ../firmware/x60-final.config
+
+
+
+        sha256sum \
+          ../firmware/*.bin \
+          > ../firmware/SHA256SUMS
+
+
+
+
+    #################################################
+    # Upload
+    #################################################
+
+    - name: Upload firmware
+
+      uses: actions/upload-artifact@v4
+
+      with:
+
+        name: RG-X60-firmware
+
+        path: firmware/
+
+        retention-days: 30
+
+
+
+
+    #################################################
+    # Failure logs
+    #################################################
+
+    - name: Upload failure logs
+
+      if: failure()
+
+      uses: actions/upload-artifact@v4
+
+      with:
+
+        name: RG-X60-build-failure-logs
+
+        path: |
+
+          build.log
+
+          download-parallel.log
+
+          download-single.log
+
+          x60-final.config
+
+          openwrt/.config
+
+        retention-days: 7
