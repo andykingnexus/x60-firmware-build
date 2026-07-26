@@ -82,6 +82,7 @@ jobs:
           set -euo pipefail
 
           sudo apt-get update
+
           sudo apt-get install -y --no-install-recommends \
             ack \
             antlr3 \
@@ -356,7 +357,7 @@ jobs:
           require_y CONFIG_PACKAGE_kmod-nft-offload
 
           echo
-          echo "===== eBPF / BTF ====="
+          echo "===== eBPF / BTF / external DAE dependencies ====="
 
           REQUIRED_BPF_OPTIONS=(
             CONFIG_KERNEL_CGROUPS
@@ -369,6 +370,9 @@ jobs:
             CONFIG_KERNEL_DEBUG_INFO_BTF_MODULES
             CONFIG_KERNEL_XDP_SOCKETS
             CONFIG_PACKAGE_kmod-xdp-sockets-diag
+            CONFIG_PACKAGE_kmod-sched-bpf
+            CONFIG_PACKAGE_kmod-veth
+            CONFIG_PACKAGE_kmod-tun
           )
 
           for option in "${REQUIRED_BPF_OPTIONS[@]}"; do
@@ -382,6 +386,8 @@ jobs:
             echo "ERROR: CONFIG_KERNEL_DEBUG_INFO_REDUCED 必须关闭"
             exit 1
           fi
+
+          echo "OK: eBPF/BTF 和外置 DAE 内核依赖完整"
 
           echo
           echo "===== 不内置 dae / 不需要的应用 ====="
@@ -413,15 +419,12 @@ jobs:
           echo
           echo "===== 未启用父包的 INCLUDE 子选项 ====="
 
-          # 这些 INCLUDE_* 是 feeds 中包配置的默认布尔值。
-          # 当 luci-app-passwall / ssr-plus / vssr / rclone 父包未启用时，
-          # 它们不会拉取或安装任何后端，仅在父包被选择时才参与依赖计算。
-          # 因此这里只记录，不作为构建失败条件。
           if grep -qE \
             '^CONFIG_PACKAGE_luci-app-(passwall|ssr-plus|vssr|rclone)_INCLUDE_.*=(y|m)$' \
             .config
           then
             echo "INFO: 检测到父包关闭时无效的 INCLUDE 默认值；不会编入固件："
+
             grep -E \
               '^CONFIG_PACKAGE_luci-app-(passwall|ssr-plus|vssr|rclone)_INCLUDE_.*=(y|m)$' \
               .config
@@ -430,17 +433,49 @@ jobs:
           fi
 
           echo
-          echo "===== legacy iptables/ipset/ebtables ====="
+          echo "===== legacy iptables/ipset/ebtables 检查 ====="
 
           LEGACY_REGEX='^CONFIG_PACKAGE_(iptables(-.*)?|ip6tables(-.*)?|iptables-mod-.*|kmod-ipt-.*|kmod-ip6tables(-.*)?|kmod-nf-ipt6?|ipset|libipset|libiptext.*|libxtables|xtables-nft|ebtables(-.*)?|kmod-ebtables(-.*)?|kmod-nft-compat)=(y|m)$'
 
-          if grep -qE "${LEGACY_REGEX}" .config; then
-            echo "ERROR: 最终配置仍包含 legacy/compat 防火墙组件："
-            grep -E "${LEGACY_REGEX}" .config
+          mapfile -t LEGACY_ENABLED < <(
+            grep -E "${LEGACY_REGEX}" .config || true
+          )
+
+          FORBIDDEN_LEGACY=()
+          ALLOWED_COMPAT=()
+
+          for entry in "${LEGACY_ENABLED[@]}"; do
+            case "${entry}" in
+              CONFIG_PACKAGE_kmod-ipt-conntrack=y|\
+              CONFIG_PACKAGE_kmod-ipt-conntrack=m|\
+              CONFIG_PACKAGE_kmod-ipt-core=y|\
+              CONFIG_PACKAGE_kmod-ipt-core=m|\
+              CONFIG_PACKAGE_kmod-nf-ipt=y|\
+              CONFIG_PACKAGE_kmod-nf-ipt=m)
+                ALLOWED_COMPAT+=("${entry}")
+                ;;
+
+              *)
+                FORBIDDEN_LEGACY+=("${entry}")
+                ;;
+            esac
+          done
+
+          if (( ${#ALLOWED_COMPAT[@]} > 0 )); then
+            echo "INFO: 厂商内核组件依赖以下最小 xtables/conntrack 兼容链："
+            printf '  %s\n' "${ALLOWED_COMPAT[@]}"
+          else
+            echo "INFO: 当前依赖收敛未选择最小兼容链"
+          fi
+
+          if (( ${#FORBIDDEN_LEGACY[@]} > 0 )); then
+            echo "ERROR: 最终配置仍包含不允许的 legacy/compat 防火墙组件："
+            printf '  %s\n' "${FORBIDDEN_LEGACY[@]}"
             exit 1
           fi
 
-          echo "OK: OpenWrt 配置校验通过"
+          echo "OK: 未启用用户态 iptables、ip6tables、ipset、ebtables、"
+          echo "    legacy NAT/offload/扩展模块；仅允许最小内核兼容链。"
 
       - name: Optional SSH debug
         if: >-
@@ -497,10 +532,12 @@ jobs:
 
           if (( ${#KERNEL_CONFIGS[@]} == 0 )); then
             echo "ERROR: 找不到 Filogic Linux 6.6 内核配置"
+
             find build_dir \
               -type f \
               -path '*/linux*/.config' \
               -print || true
+
             exit 1
           fi
 
