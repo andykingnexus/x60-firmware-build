@@ -1,11 +1,27 @@
---- a/drivers/net/ethernet/mediatek/Kconfig
-+++ b/drivers/net/ethernet/mediatek/Kconfig
-@@ -58,7 +58,7 @@ config MEDIATEK_NETSYS_V3
+ id="v3d6tp"
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andy <andy@example.com>
+Date: Sat, 26 Jul 2026 12:00:00 +0800
+Subject: [PATCH] mediatek: mtkhnat: use generic NF_NAT dependency
 
+MediaTek mtkhnat driver uses modern netfilter NAT APIs
+and does not require legacy IP_NF_NAT.
+
+This allows firewall4/nftables-only systems to use
+hardware NAT acceleration without pulling legacy iptables
+kernel modules.
+
+Signed-off-by: Andy <andy@example.com>
+---
+
+--- a/target/linux/mediatek/files-6.6/drivers/net/ethernet/mediatek/mtk_hnat/Kconfig
++++ b/target/linux/mediatek/files-6.6/drivers/net/ethernet/mediatek/mtk_hnat/Kconfig
+@@ -1,7 +1,7 @@
  config NET_MEDIATEK_HNAT
- 	tristate "MediaTek HW NAT support"
+ 	tristate "MediaTek Hardware NAT"
 -	depends on NET_MEDIATEK_SOC && NF_CONNTRACK && IP_NF_NAT
 +	depends on NET_MEDIATEK_SOC && NF_CONNTRACK && NF_NAT
+ 	select RFS_ACCEL
+ 	select NET_FLOW_LIMIT
  	help
- 	  This driver supports the hardward Network Address Translation
- 	  in the MediaTek MT7988/MT7986/MT2701/MT7622/MT7629/MT7621 chipset
+ 	  This driver supports MediaTek Hardware NAT acceleration.
