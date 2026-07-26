@@ -108,6 +108,7 @@ jobs:
             gcc-multilib \
             g++-multilib \
             git \
+            gnutls-dev \
             gperf \
             haveged \
             help2man \
@@ -117,7 +118,6 @@ jobs:
             libelf-dev \
             libglib2.0-dev \
             libgmp3-dev \
-            libgnutls28-dev \
             libltdl-dev \
             libmpc-dev \
             libmpfr-dev \
@@ -185,7 +185,7 @@ jobs:
           echo "源码提交：$(git rev-parse HEAD)"
           git log -1 --oneline
 
-      - name: Fix HNAT dependency to generic NF_NAT
+      - name: Fix HNAT kernel dependency
         working-directory: ${{ env.OPENWRT_DIR }}
         shell: bash
         run: |
@@ -215,10 +215,10 @@ jobs:
               "${PATCH_ROOT}" || true
           )
 
-          echo "旧依赖匹配文件：${#OLD_FILES[@]}"
+          echo "旧依赖文件数：${#OLD_FILES[@]}"
           printf '%s\n' "${OLD_FILES[@]:-}"
 
-          echo "新依赖匹配文件：${#NEW_FILES[@]}"
+          echo "新依赖文件数：${#NEW_FILES[@]}"
           printf '%s\n' "${NEW_FILES[@]:-}"
 
           if (( ${#OLD_FILES[@]} == 1 )); then
@@ -247,10 +247,10 @@ jobs:
           PY
 
           elif (( ${#OLD_FILES[@]} == 0 && ${#NEW_FILES[@]} >= 1 )); then
-            echo "HNAT 已使用通用 NF_NAT，无需修改。"
+            echo "HNAT 内核补丁已使用通用 NF_NAT，无需修改。"
 
           else
-            echo "ERROR: HNAT 依赖匹配数量异常。"
+            echo "ERROR: HNAT 内核依赖匹配数量异常。"
 
             grep -Rns \
               --include='*.patch' \
@@ -274,11 +274,11 @@ jobs:
             -F "${NEW_DEP}" \
             "${PATCH_ROOT}"
           then
-            echo "ERROR: 修改后未找到 NF_NAT 依赖。"
+            echo "ERROR: 修改后没有找到通用 NF_NAT 依赖。"
             exit 1
           fi
 
-          echo "最终 HNAT 依赖："
+          echo "最终 HNAT 内核依赖："
 
           grep -Rns \
             --include='*.patch' \
@@ -296,6 +296,292 @@ jobs:
 
           ./scripts/feeds install -a \
             2>&1 | tee ../feeds-install.log
+
+      - name: Fix HNAT package dependencies
+        working-directory: ${{ env.OPENWRT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "===== 搜索 HNAT OpenWrt 包定义 ====="
+
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          roots = [
+              Path("package"),
+              Path("target"),
+              Path("feeds"),
+          ]
+
+          markers = (
+              "mediatek_hnat",
+              "mediatek-hnat",
+              "mtkhnat",
+              "mtk_hnat",
+              "mtk-hnat",
+              "kmod-mediatek_hnat",
+              "kmod-mediatek-hnat",
+          )
+
+          old_dependencies = (
+              "+kmod-ipt-conntrack",
+              "+kmod-ipt-nat",
+          )
+
+          candidate_files = []
+
+          for root in roots:
+              if not root.exists():
+                  continue
+
+              paths = list(root.rglob("Makefile"))
+              paths.extend(root.rglob("*.mk"))
+
+              for path in paths:
+                  try:
+                      text = path.read_text(
+                          encoding="utf-8",
+                          errors="ignore",
+                      )
+                  except OSError:
+                      continue
+
+                  lower = text.lower()
+
+                  if any(marker in lower for marker in markers):
+                      candidate_files.append(path)
+
+          candidate_files = sorted(set(candidate_files))
+
+          print("HNAT 相关包定义文件：")
+
+          for path in candidate_files:
+              print(f"  {path}")
+
+          if not candidate_files:
+              print(
+                  "ERROR: 没有找到 HNAT OpenWrt 包定义。",
+                  file=sys.stderr,
+              )
+              raise SystemExit(1)
+
+          old_matches = []
+
+          for path in candidate_files:
+              text = path.read_text(
+                  encoding="utf-8",
+                  errors="ignore",
+              )
+
+              for dependency in old_dependencies:
+                  count = text.count(dependency)
+
+                  if count:
+                      old_matches.append(
+                          (path, dependency, count)
+                      )
+
+          print("\n旧依赖匹配：")
+
+          for path, dependency, count in old_matches:
+              print(
+                  f"  {path}: {dependency}: {count} 处"
+              )
+
+          total_old = sum(
+              count for _, _, count in old_matches
+          )
+
+          if total_old == 0:
+              already_fixed = False
+
+              for path in candidate_files:
+                  text = path.read_text(
+                      encoding="utf-8",
+                      errors="ignore",
+                  )
+
+                  if (
+                      "+kmod-nf-conntrack" in text
+                      and "+kmod-nf-nat" in text
+                  ):
+                      already_fixed = True
+                      print(
+                          "\nHNAT 包定义已使用 "
+                          "kmod-nf-conntrack 和 kmod-nf-nat："
+                      )
+                      print(f"  {path}")
+
+              if already_fixed:
+                  raise SystemExit(0)
+
+              print(
+                  "ERROR: 找到了 HNAT 包定义，但没有找到"
+                  "旧 iptables 依赖，也没有找到新的通用"
+                  " netfilter 依赖。",
+                  file=sys.stderr,
+              )
+
+              print(
+                  "\n所有 kmod-ipt-conntrack 引用：",
+                  file=sys.stderr,
+              )
+
+              for root in roots:
+                  if not root.exists():
+                      continue
+
+                  for path in list(root.rglob("Makefile")) + \
+                              list(root.rglob("*.mk")):
+                      try:
+                          text = path.read_text(
+                              encoding="utf-8",
+                              errors="ignore",
+                          )
+                      except OSError:
+                          continue
+
+                      if "kmod-ipt-conntrack" in text:
+                          for number, line in enumerate(
+                              text.splitlines(),
+                              start=1,
+                          ):
+                              if "kmod-ipt-conntrack" in line:
+                                  print(
+                                      f"{path}:{number}:{line}",
+                                      file=sys.stderr,
+                                  )
+
+              raise SystemExit(1)
+
+          if total_old > 2:
+              print(
+                  "ERROR: HNAT 包定义中的旧依赖匹配过多，"
+                  f"实际为 {total_old} 处。",
+                  file=sys.stderr,
+              )
+              raise SystemExit(1)
+
+          changed_files = []
+
+          for path in candidate_files:
+              text = path.read_text(
+                  encoding="utf-8",
+                  errors="strict",
+              )
+              original = text
+
+              text = text.replace(
+                  "+kmod-ipt-conntrack",
+                  "+kmod-nf-conntrack +kmod-nf-nat",
+              )
+
+              text = text.replace(
+                  "+kmod-ipt-nat",
+                  "+kmod-nf-nat",
+              )
+
+              text = re.sub(
+                  r"(\+kmod-nf-nat)"
+                  r"(?:[ \t]+\+kmod-nf-nat)+",
+                  r"\1",
+                  text,
+              )
+
+              text = re.sub(
+                  r"(\+kmod-nf-conntrack)"
+                  r"(?:[ \t]+\+kmod-nf-conntrack)+",
+                  r"\1",
+                  text,
+              )
+
+              if text != original:
+                  path.write_text(
+                      text,
+                      encoding="utf-8",
+                  )
+                  changed_files.append(path)
+
+          if not changed_files:
+              print(
+                  "ERROR: 找到了旧依赖但没有修改任何文件。",
+                  file=sys.stderr,
+              )
+              raise SystemExit(1)
+
+          print("\n已修改文件：")
+
+          for path in changed_files:
+              print(f"  {path}")
+
+          remaining = []
+
+          for path in candidate_files:
+              text = path.read_text(
+                  encoding="utf-8",
+                  errors="ignore",
+              )
+
+              for dependency in old_dependencies:
+                  if dependency in text:
+                      remaining.append(
+                          (path, dependency)
+                      )
+
+          if remaining:
+              print(
+                  "ERROR: 修改后仍存在 HNAT 旧依赖：",
+                  file=sys.stderr,
+              )
+
+              for path, dependency in remaining:
+                  print(
+                      f"  {path}: {dependency}",
+                      file=sys.stderr,
+                  )
+
+              raise SystemExit(1)
+
+          new_dependency_found = False
+
+          for path in candidate_files:
+              text = path.read_text(
+                  encoding="utf-8",
+                  errors="ignore",
+              )
+
+              if (
+                  "+kmod-nf-conntrack" in text
+                  and "+kmod-nf-nat" in text
+              ):
+                  new_dependency_found = True
+
+          if not new_dependency_found:
+              print(
+                  "ERROR: 修改后没有检测到完整的通用 "
+                  "netfilter 依赖。",
+                  file=sys.stderr,
+              )
+              raise SystemExit(1)
+
+          print(
+              "\nOK: HNAT 包级依赖已改为 "
+              "kmod-nf-conntrack + kmod-nf-nat"
+          )
+          PY
+
+          echo
+          echo "===== 修改后的 HNAT 包依赖 ====="
+
+          grep -Rns \
+            --include='Makefile' \
+            --include='*.mk' \
+            -E 'mediatek[_-]?hnat|mtk[_-]?hnat|kmod-nf-(conntrack|nat)' \
+            package target feeds 2>/dev/null |
+            head -n 100 || true
 
       - name: Restore ccache
         if: >-
@@ -332,27 +618,26 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          set -o pipefail
 
           cp "../${CONFIG_FILE}" .config
 
-          echo "===== 初次解析基础配置 ====="
+          echo "===== 初次解析配置 ====="
 
           make defconfig \
             2>&1 | tee ../defconfig-initial.log
 
-          echo
-          echo "===== 清除 legacy/compat 防火墙组件及拉取者 ====="
-
-          python3 <<'PY'
+          clean_config() {
+            python3 <<'PY'
           from pathlib import Path
           import re
 
           path = Path(".config")
-          lines = path.read_text(encoding="utf-8").splitlines()
+          lines = path.read_text(
+              encoding="utf-8",
+          ).splitlines()
 
           exact_disable = {
-              # 不内置代理程序。
+              # 不内置 dae。
               "CONFIG_PACKAGE_dae",
               "CONFIG_PACKAGE_daed",
               "CONFIG_PACKAGE_luci-app-daede",
@@ -368,7 +653,7 @@ jobs:
               "CONFIG_PACKAGE_miniupnpd",
               "CONFIG_PACKAGE_miniupnpd-nftables",
 
-              # 这些组件会重新拉入 iptables/fullcone/physdev。
+              # 会重新拉入 iptables/fullcone/physdev。
               "CONFIG_PACKAGE_luci-app-turboacc-mtk",
               "CONFIG_PACKAGE_luci-i18n-turboacc-mtk-zh-cn",
               "CONFIG_PACKAGE_luci-app-turboacc",
@@ -385,6 +670,8 @@ jobs:
               "CONFIG_CCACHE",
               "CONFIG_PACKAGE_firewall4",
               "CONFIG_PACKAGE_kmod-mediatek_hnat",
+              "CONFIG_PACKAGE_kmod-nf-conntrack",
+              "CONFIG_PACKAGE_kmod-nf-nat",
 
               # 用户确认的 dae/eBPF/BTF 内核依赖。
               "CONFIG_KERNEL_CGROUPS",
@@ -423,12 +710,16 @@ jobs:
                   return False
 
               package = symbol[len(prefix):]
-              return any(pattern.fullmatch(package)
-                         for pattern in legacy_patterns)
+
+              return any(
+                  pattern.fullmatch(package)
+                  for pattern in legacy_patterns
+              )
 
           enabled_re = re.compile(
               r"^(CONFIG_[A-Za-z0-9_-]+)=(.*)$"
           )
+
           disabled_re = re.compile(
               r"^# (CONFIG_[A-Za-z0-9_-]+) is not set$"
           )
@@ -468,13 +759,17 @@ jobs:
               output.append(line)
 
           output.append("")
-          output.append("# Custom RG-X60 pure nftables overrides")
+          output.append("# Custom RG-X60 overrides")
 
           for symbol in sorted(disabled):
-              output.append(f"# {symbol} is not set")
+              output.append(
+                  f"# {symbol} is not set"
+              )
 
           for symbol in sorted(required_enable):
-              output.append(f"{symbol}=y")
+              output.append(
+                  f"{symbol}=y"
+              )
 
           output.append(
               "# CONFIG_KERNEL_DEBUG_INFO_REDUCED is not set"
@@ -485,22 +780,33 @@ jobs:
               encoding="utf-8",
           )
 
-          print("Removed enabled selections:")
+          print("本轮清除的已启用项目：")
 
           for line in removed:
               print(f"  {line}")
           PY
+          }
 
           echo
-          echo "===== 重新收敛依赖 ====="
+          echo "===== 第一轮清理 ====="
+
+          clean_config
 
           make defconfig \
-            2>&1 | tee ../defconfig-clean.log
+            2>&1 | tee ../defconfig-clean-1.log
+
+          echo
+          echo "===== 第二轮清理 ====="
+
+          clean_config
+
+          make defconfig \
+            2>&1 | tee ../defconfig-clean-2.log
 
           cp .config ../x60-final.config
 
           echo
-          echo "===== 收敛后的 legacy 检查预览 ====="
+          echo "===== 最终 legacy 配置预览 ====="
 
           grep -E \
             '^CONFIG_PACKAGE_(iptables|ip6tables|iptables-mod-|kmod-ipt-|kmod-ip6tables|kmod-nf-ipt|ipset|libipset|libiptext|libxtables|xtables-nft|ebtables|kmod-ebtables|kmod-nft-compat).*=(y|m)$' \
@@ -564,6 +870,8 @@ jobs:
           echo "===== HNAT / firewall4 ====="
 
           require_y CONFIG_PACKAGE_kmod-mediatek_hnat
+          require_y CONFIG_PACKAGE_kmod-nf-conntrack
+          require_y CONFIG_PACKAGE_kmod-nf-nat
           require_y CONFIG_PACKAGE_firewall4
 
           echo
@@ -801,7 +1109,7 @@ jobs:
             find "${OUTPUT_DIR}" \
               -maxdepth 1 \
               -type f \
-              -name "*-${DEVICE_NAME}-squashfs-sysupgrade.bin" \
+              -name "*${DEVICE_NAME}*squashfs-sysupgrade.bin" \
               -print
           )
 
@@ -854,9 +1162,7 @@ jobs:
       - name: Upload firmware
         uses: actions/upload-artifact@v4
         with:
-          name: >-
-            RG-X60-${{ env.BUILD_ID }}-${{
-            env.SOURCE_SHORT_SHA }}
+          name: RG-X60-${{ env.BUILD_ID }}-${{ env.SOURCE_SHORT_SHA }}
           path: firmware/
           if-no-files-found: error
           retention-days: 30
