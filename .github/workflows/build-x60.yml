@@ -1,0 +1,138 @@
+name: Build Ruijie RG-X60 Firmware
+
+on:
+  workflow_dispatch:
+    inputs:
+      ssh_debug:
+        description: "编译前是否开启 tmate SSH 调试"
+        required: false
+        default: "false"
+  push:
+    branches: ["main"]
+    paths:
+      - "defconfig/x60.config"
+      - "patches/**"
+      - ".github/workflows/build-x60.yml"
+
+env:
+  # 上游源码：Ruijie 官方社区仓库
+  REPO_URL: https://github.com/RuijieNetworksCommunity/MT798X-6.6-24.10
+  REPO_BRANCH: openwrt-24.10-6.6
+  BUILD_DIR: openwrt
+  DEVICE_TARGET: ruijie-rg-x60
+  CONFIG_FILE: x60.config
+  TZ: Asia/Seoul
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 检出本仓库（defconfig / patches）
+        uses: actions/checkout@v4
+
+      - name: 释放磁盘空间
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          swap-storage: false
+
+      - name: 初始化编译环境
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ack antlr3 asciidoc autoconf automake autopoint binutils bison \
+            build-essential bzip2 ccache clang cmake cpio curl device-tree-compiler ecj fastjar \
+            flex gawk gettext gcc-multilib g++-multilib git gnutls-dev gperf haveged help2man \
+            intltool lib32gcc-s1 libc6-dev-i386 libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev \
+            libmpc-dev libmpfr-dev libncurses-dev libpython3-dev libreadline-dev libssl-dev \
+            libtool libyaml-dev libz-dev lld llvm lrzsz mkisofs msmtp nano ninja-build p7zip \
+            p7zip-full patch pkgconf python3 python3-pip python3-ply python3-docutils \
+            python3-pyelftools qemu-utils re2c rsync scons squashfs-tools subversion swig \
+            texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev zstd
+          sudo timedatectl set-timezone "$TZ"
+
+      - name: 克隆 Ruijie 官方源码
+        run: |
+          git clone --filter=blob:none -b $REPO_BRANCH $REPO_URL $BUILD_DIR
+          cd $BUILD_DIR
+          echo "HEAD: $(git rev-parse HEAD)"
+
+      - name: 应用 HNAT NF_NAT 内核补丁（解除 legacy iptables 强依赖）
+        run: |
+          cp patches/zzz-999-mtkhnat-use-generic-nf-nat-dependency.patch \
+             $BUILD_DIR/target/linux/mediatek/patches-6.6/
+          echo "补丁已放入 target/linux/mediatek/patches-6.6/，将在内核解包时自动应用"
+
+      - name: 更新 & 安装 feeds
+        working-directory: ${{ env.BUILD_DIR }}
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: 写入自定义 defconfig
+        working-directory: ${{ env.BUILD_DIR }}
+        run: |
+          cp ../defconfig/$CONFIG_FILE .config
+          make defconfig
+
+      - name: 校验配置是否被 Kconfig 依赖关系丢弃
+        working-directory: ${{ env.BUILD_DIR }}
+        run: |
+          echo "--- 校验 eBPF/BTF 相关选项是否生效 ---"
+          for sym in KERNEL_DEBUG_INFO_BTF KERNEL_BPF_EVENTS KERNEL_CGROUP_BPF KERNEL_XDP_SOCKETS KERNEL_BPF_STREAM_PARSER KERNEL_NETKIT; do
+            if grep -q "^CONFIG_${sym}=y" .config; then
+              echo "OK  : CONFIG_${sym}=y"
+            else
+              echo "WARN: CONFIG_${sym} 未生效，检查依赖链（可能被 SMALL_FLASH / DEBUG_INFO_REDUCED 等条件挡住）"
+            fi
+          done
+          echo "--- 校验目标设备 ---"
+          grep "CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_${DEVICE_TARGET}" .config || \
+            (echo "错误：目标设备未出现在 .config 中" && exit 1)
+
+      - name: 可选 SSH 调试（tmate）
+        if: ${{ github.event.inputs.ssh_debug == 'true' }}
+        uses: mxschmitt/action-tmate@v3
+        timeout-minutes: 60
+
+      - name: 下载编译所需软件包源码
+        working-directory: ${{ env.BUILD_DIR }}
+        run: make download -j8
+
+      - name: 编译固件
+        working-directory: ${{ env.BUILD_DIR }}
+        run: |
+          make -j$(nproc) V=s || make -j1 V=s
+
+      - name: 整理产物
+        id: artifacts
+        working-directory: ${{ env.BUILD_DIR }}
+        run: |
+          mkdir -p ../firmware-out
+          find bin/targets/mediatek/filogic -maxdepth 1 \
+            \( -iname "*${DEVICE_TARGET}*sysupgrade.bin" -o -iname "*${DEVICE_TARGET}*factory.bin" \) \
+            -exec cp {} ../firmware-out/ \;
+          cp .config ../firmware-out/x60-full.config
+          ls -la ../firmware-out
+
+      - name: 上传固件产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ruijie-rg-x60-firmware-${{ github.run_number }}
+          path: firmware-out/
+          retention-days: 14
+
+      - name: 上传编译日志（失败时）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ github.run_number }}
+          path: |
+            ${{ env.BUILD_DIR }}/logs/
+            ${{ env.BUILD_DIR }}/.config
+          retention-days: 7
