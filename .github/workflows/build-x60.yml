@@ -378,6 +378,13 @@ jobs:
           echo "OK: 单设备普通 RG-X60"
 
           echo
+          echo "===== MediaTek Wi-Fi ====="
+
+          # mt_wifi 7.6.7.2 的 MURU 头文件会无条件引用该选项定义的
+          # MAX_NUM_TXCMD_USER_INFO；关闭时驱动在编译阶段失败。
+          require_y CONFIG_MTK_CFG_SUPPORT_FALCON_TXCMD_DBG
+
+          echo
           echo "===== HNAT / firewall4 / nftables ====="
 
           require_y CONFIG_PACKAGE_kmod-mediatek_hnat
