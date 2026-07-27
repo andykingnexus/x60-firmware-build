@@ -383,6 +383,13 @@ jobs:
           require_y CONFIG_PACKAGE_kmod-mediatek_hnat
           require_y CONFIG_PACKAGE_kmod-nf-conntrack
           require_y CONFIG_PACKAGE_kmod-nf-nat
+
+          # MediaTek 厂商组件仍需要这三个仅内核兼容包。
+          # 用户态 iptables/ip6tables 以及其他 legacy 扩展继续禁用。
+          require_y CONFIG_PACKAGE_kmod-ipt-core
+          require_y CONFIG_PACKAGE_kmod-ipt-conntrack
+          require_y CONFIG_PACKAGE_kmod-nf-ipt
+
           require_y CONFIG_PACKAGE_firewall4
           require_y CONFIG_PACKAGE_kmod-nft-core
           require_y CONFIG_PACKAGE_kmod-nft-nat
@@ -474,9 +481,12 @@ jobs:
               if match:
                   enabled[match.group(1)] = match.group(2)
 
+          # 仅允许 MediaTek 厂商组件所需的三个内核兼容包。
+          # 用户态 iptables/ip6tables/ipset/xtables/ebtables，以及其他
+          # legacy NAT、offload 和扩展模块仍由下方规则禁止。
           allowed = {
-              "CONFIG_PACKAGE_kmod-ipt-conntrack",
               "CONFIG_PACKAGE_kmod-ipt-core",
+              "CONFIG_PACKAGE_kmod-ipt-conntrack",
               "CONFIG_PACKAGE_kmod-nf-ipt",
           }
 
