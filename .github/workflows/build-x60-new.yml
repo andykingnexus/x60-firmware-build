@@ -1,4 +1,4 @@
-name: Build RG-X60
+name: Build RG-X60 New
 
 on:
   push:
@@ -33,14 +33,14 @@ env:
   OPENWRT_BRANCH: openwrt-24.10-6.6
   OPENWRT_DIR: openwrt
   CONFIG_FILE: defconfig/x60-new.config
-  DEVICE_NAME: ruijie_rg-x60-new-new
+  DEVICE_NAME: ruijie_rg-x60-new
   OUTPUT_DIR: bin/targets/mediatek/filogic
   CCACHE_DIR: ${{ github.workspace }}/.ccache
   SOURCE_MIRROR: https://sources.immortalwrt.org
 
 jobs:
   build:
-    name: Build RG-X60
+    name: Build RG-X60 New
     runs-on: ubuntu-24.04
     timeout-minutes: 360
 
@@ -369,7 +369,7 @@ jobs:
           fi
 
           if [[ "${SELECTED_TARGETS[0]}" != \
-            "CONFIG_TARGET_mediatek_filogic_DEVICE_ruijie_rg-x60-new-new=y" ]]
+            "CONFIG_TARGET_mediatek_filogic_DEVICE_ruijie_rg-x60-new=y" ]]
           then
             echo "ERROR: 目标不是 RG-X60 New"
             echo "实际：${SELECTED_TARGETS[0]}"
