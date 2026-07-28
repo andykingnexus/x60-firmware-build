@@ -231,55 +231,6 @@ jobs:
           ccache --zero-stats
           ccache --show-config
 
-      - name: Change HNAT dependency to generic NF_NAT
-        working-directory: ${{ env.OPENWRT_DIR }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          PATCH_FILE="target/linux/mediatek/patches-6.6/999-2745-mtkhnat-add-mtkhnat-driver-support.patch"
-          OLD_DEP='depends on NET_MEDIATEK_SOC && NF_CONNTRACK && IP_NF_NAT'
-          NEW_DEP='depends on NET_MEDIATEK_SOC && NF_CONNTRACK && NF_NAT'
-
-          test -f "${PATCH_FILE}" || {
-            echo "ERROR: 找不到 ${PATCH_FILE}"
-            exit 1
-          }
-
-          python3 - "${PATCH_FILE}" "${OLD_DEP}" "${NEW_DEP}" <<'PY'
-          from pathlib import Path
-          import sys
-
-          path = Path(sys.argv[1])
-          old = sys.argv[2]
-          new = sys.argv[3]
-          text = path.read_text(encoding="utf-8")
-
-          old_count = text.count(old)
-          new_count = text.count(new)
-
-          if old_count == 1:
-              path.write_text(
-                  text.replace(old, new, 1),
-                  encoding="utf-8",
-              )
-              print(f"已修改：{old} -> {new}")
-          elif old_count == 0 and new_count >= 1:
-              print("上游已经使用 NF_NAT，无需重复修改。")
-          else:
-              raise SystemExit(
-                  "ERROR: HNAT 依赖匹配异常："
-                  f"old={old_count}, new={new_count}"
-              )
-          PY
-
-          if grep -Fq "${OLD_DEP}" "${PATCH_FILE}"; then
-            echo "ERROR: 修改后仍存在 IP_NF_NAT 依赖"
-            exit 1
-          fi
-
-          grep -nF "${NEW_DEP}" "${PATCH_FILE}"
-
       - name: Update and install feeds
         working-directory: ${{ env.OPENWRT_DIR }}
         shell: bash
@@ -292,7 +243,7 @@ jobs:
           ./scripts/feeds install -a \
             2>&1 | tee ../feeds-install.log
 
-      - name: Apply x60.config and set source mirror
+      - name: Apply conservative x60-new.config and set source mirror
         working-directory: ${{ env.OPENWRT_DIR }}
         shell: bash
         run: |
@@ -403,6 +354,11 @@ jobs:
           require_y CONFIG_PACKAGE_kmod-ipt-core
           require_y CONFIG_PACKAGE_kmod-ipt-conntrack
           require_y CONFIG_PACKAGE_kmod-nf-ipt
+          require_y CONFIG_PACKAGE_kmod-ipt-nat
+          require_y CONFIG_PACKAGE_iptables-nft
+          require_y CONFIG_PACKAGE_ip6tables-nft
+          require_y CONFIG_PACKAGE_ipset
+          require_y CONFIG_PACKAGE_ebtables
 
           require_y CONFIG_PACKAGE_firewall4
           require_y CONFIG_PACKAGE_kmod-nft-core
@@ -487,85 +443,6 @@ jobs:
           grep -E \
             '^CONFIG_PACKAGE_luci-app-(passwall|ssr-plus|vssr|rclone)_INCLUDE_.*=(y|m)$' \
             .config || true
-
-          echo
-          echo "===== legacy/compat 防火墙组件 ====="
-
-          python3 <<'PY'
-          from pathlib import Path
-          import re
-
-          enabled = {}
-
-          for line in Path(".config").read_text(
-              encoding="utf-8",
-          ).splitlines():
-              match = re.fullmatch(
-                  r"(CONFIG_PACKAGE_[A-Za-z0-9_-]+)=(y|m)",
-                  line,
-              )
-              if match:
-                  enabled[match.group(1)] = match.group(2)
-
-          # 仅允许 MediaTek 厂商组件所需的三个内核兼容包。
-          # 用户态 iptables/ip6tables/ipset/xtables/ebtables，以及其他
-          # legacy NAT、offload 和扩展模块仍由下方规则禁止。
-          allowed = {
-              "CONFIG_PACKAGE_kmod-ipt-core",
-              "CONFIG_PACKAGE_kmod-ipt-conntrack",
-              "CONFIG_PACKAGE_kmod-nf-ipt",
-          }
-
-          patterns = (
-              re.compile(r"CONFIG_PACKAGE_iptables(?:-.*)?$"),
-              re.compile(r"CONFIG_PACKAGE_ip6tables(?:-.*)?$"),
-              re.compile(r"CONFIG_PACKAGE_iptables-mod-.*$"),
-              re.compile(r"CONFIG_PACKAGE_kmod-ipt-.*$"),
-              re.compile(r"CONFIG_PACKAGE_kmod-ip6tables(?:-.*)?$"),
-              re.compile(r"CONFIG_PACKAGE_kmod-nf-ipt6?$"),
-              re.compile(r"CONFIG_PACKAGE_ipset$"),
-              re.compile(r"CONFIG_PACKAGE_libipset$"),
-              re.compile(r"CONFIG_PACKAGE_libiptext.*$"),
-              re.compile(r"CONFIG_PACKAGE_libxtables$"),
-              re.compile(r"CONFIG_PACKAGE_xtables-nft$"),
-              re.compile(r"CONFIG_PACKAGE_ebtables(?:-.*)?$"),
-              re.compile(r"CONFIG_PACKAGE_kmod-ebtables(?:-.*)?$"),
-              re.compile(r"CONFIG_PACKAGE_kmod-nft-compat$"),
-          )
-
-          compat = []
-          forbidden = []
-
-          for symbol, value in sorted(enabled.items()):
-              if not any(
-                  pattern.fullmatch(symbol)
-                  for pattern in patterns
-              ):
-                  continue
-
-              entry = f"{symbol}={value}"
-
-              if symbol in allowed:
-                  compat.append(entry)
-              else:
-                  forbidden.append(entry)
-
-          if compat:
-              print("INFO: 厂商组件自动保留的最小内核兼容链：")
-              for entry in compat:
-                  print(f"  {entry}")
-
-          if forbidden:
-              print("ERROR: 仍有不允许的 legacy/compat 组件：")
-              for entry in forbidden:
-                  print(f"  {entry}")
-              raise SystemExit(1)
-
-          print(
-              "OK: 未启用用户态 iptables/ipset/ebtables，"
-              "也未启用 legacy NAT/offload 扩展。"
-          )
-          PY
 
       - name: Optional SSH debug
         if: ${{ inputs.ssh_debug == true }}
