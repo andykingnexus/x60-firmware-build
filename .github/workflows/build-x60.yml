@@ -383,7 +383,27 @@ jobs:
             exit 1
           fi
 
-          echo "OK: RG-X60 IPA/iLNA + DAE + iptables compatibility"
+          echo
+          echo "===== lite 基线定制关闭项 ====="
+
+          DISABLED_LITE_OPTIONS=(
+            CONFIG_MTK_MGMT_TXPWR_CTRL
+            CONFIG_PACKAGE_luci-app-upnp
+            CONFIG_PACKAGE_luci-i18n-upnp-zh-cn
+            CONFIG_PACKAGE_miniupnpd
+            CONFIG_PACKAGE_miniupnpd-nftables
+            CONFIG_PACKAGE_luci-app-wrtbwmon
+            CONFIG_PACKAGE_luci-i18n-wrtbwmon-zh-cn
+            CONFIG_PACKAGE_wrtbwmon
+            CONFIG_PACKAGE_luci-app-design-config
+            CONFIG_PACKAGE_luci-i18n-design-config-zh-cn
+          )
+
+          for option in "${DISABLED_LITE_OPTIONS[@]}"; do
+            require_disabled "${option}"
+          done
+
+          echo "OK: RG-X60 lite + IPA/iLNA + DAE/BTF + firewall compatibility"
 
       - name: Optional SSH debug
         if: ${{ inputs.ssh_debug == true }}
