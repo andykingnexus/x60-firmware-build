@@ -346,7 +346,11 @@ jobs:
 
           require_y CONFIG_PACKAGE_kmod-mediatek_hnat
           require_y CONFIG_PACKAGE_ipset
-          require_y CONFIG_PACKAGE_ebtables
+          # 此旧分支会在 make defconfig 时移除不存在的用户态 ebtables
+          # 元包；内核 ebtables 兼容链才是设备所需的有效选项。
+          require_y CONFIG_PACKAGE_kmod-ebtables
+          require_y CONFIG_PACKAGE_kmod-ebtables-ipv4
+          require_y CONFIG_PACKAGE_kmod-ebtables-ipv6
           require_y CONFIG_PACKAGE_iptables-mod-tproxy
           require_y CONFIG_PACKAGE_kmod-ipt-tproxy
 
