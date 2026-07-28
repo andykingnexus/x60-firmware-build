@@ -193,6 +193,45 @@ jobs:
           echo "源码提交：${SOURCE_COMMIT}"
           git log -1 --oneline
 
+      - name: Fix mt_wifi management TX power declaration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PATCH_FILE="${OPENWRT_DIR}/package/mtk/drivers/mt_wifi/patches-7672/026-fix-mgmt-txpwr-prototype.patch"
+
+          test -d "$(dirname "${PATCH_FILE}")" || {
+            echo "ERROR: 找不到 mt_wifi 7.6.7.2 补丁目录"
+            exit 1
+          }
+
+          python3 - "${PATCH_FILE}" <<'PY'
+          from pathlib import Path
+          import sys
+
+          patch_file = Path(sys.argv[1])
+          patch_file.write_text(
+              """--- a/mt_wifi/embedded/ap/ap_cfg.c
+          +++ b/mt_wifi/embedded/ap/ap_cfg.c
+          @@ -27,6 +27,10 @@
+           
+           #include "rt_config.h"
+           
+          +#ifdef MGMT_TXPWR_CTRL
+          +INT wtbl_update_pwr_offset(RTMP_ADAPTER *pAd, struct wifi_dev *wdev);
+          +#endif
+          +
+           #ifdef RLM_CAL_CACHE_SUPPORT
+           #include "phy/rlm_cal_cache.h"
+           #endif /* RLM_CAL_CACHE_SUPPORT */
+          """,
+              encoding="utf-8",
+          )
+          PY
+
+          echo "已添加 mt_wifi MGMT_TXPWR_CTRL 原型修复："
+          sha256sum "${PATCH_FILE}"
+
       - name: Restore download cache
         id: dl-cache
         uses: actions/cache/restore@v4
@@ -339,6 +378,7 @@ jobs:
 
           require_y CONFIG_MTK_CFG_SUPPORT_FALCON_TXCMD_DBG
           require_y CONFIG_MTK_FIRST_IF_IPAILNA
+          require_y CONFIG_MTK_MGMT_TXPWR_CTRL
           require_y CONFIG_PACKAGE_kmod-phy-airoha-en8811h
 
           echo
@@ -387,7 +427,6 @@ jobs:
           echo "===== lite 基线定制关闭项 ====="
 
           DISABLED_LITE_OPTIONS=(
-            CONFIG_MTK_MGMT_TXPWR_CTRL
             CONFIG_PACKAGE_luci-app-upnp
             CONFIG_PACKAGE_luci-i18n-upnp-zh-cn
             CONFIG_PACKAGE_miniupnpd
