@@ -341,7 +341,9 @@ jobs:
           require_y CONFIG_PACKAGE_kmod-mediatek_hnat
           require_y CONFIG_PACKAGE_kmod-warp
           require_y CONFIG_PACKAGE_luci-app-mtwifi-cfg
+          require_y CONFIG_PACKAGE_luci-app-ttyd
           require_y CONFIG_PACKAGE_luci-app-turboacc-mtk
+          require_y CONFIG_PACKAGE_ttyd
 
           echo
           echo "===== 精简项 ====="
@@ -363,7 +365,6 @@ jobs:
             CONFIG_PACKAGE_luci-app-transmission
             CONFIG_PACKAGE_luci-app-minidlna
             CONFIG_PACKAGE_luci-app-usb-printer
-            CONFIG_PACKAGE_luci-app-ttyd
             CONFIG_PACKAGE_htop
             CONFIG_PACKAGE_tcpdump
             CONFIG_PACKAGE_zram-swap
