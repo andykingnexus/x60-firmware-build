@@ -1,0 +1,537 @@
+name: Build Cetron CT3003
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/build-ct3003.yml"
+      - "defconfig/ct3003.config"
+  workflow_dispatch:
+    inputs:
+      clean_build:
+        description: "忽略 ccache，执行干净编译"
+        required: true
+        default: false
+        type: boolean
+      ssh_debug:
+        description: "在正式编译前开启 tmate SSH"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-ct3003-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TZ: Asia/Taipei
+  OPENWRT_REPO: https://github.com/padavanonly/immortalwrt-mt798x-6.6
+  OPENWRT_BRANCH: openwrt-24.10-6.6
+  OPENWRT_DIR: openwrt
+  CONFIG_FILE: defconfig/ct3003.config
+  DEVICE_NAME: cetron_ct3003
+  OUTPUT_DIR: bin/targets/mediatek/filogic
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  SOURCE_MIRROR: https://sources.immortalwrt.org
+  CACHE_VERSION: v1
+
+jobs:
+  build:
+    name: Build CT3003 firmware
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout build files
+        uses: actions/checkout@v4
+
+      - name: Validate local files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f "${CONFIG_FILE}" || {
+            echo "ERROR: 找不到 ${CONFIG_FILE}"
+            exit 1
+          }
+
+          echo "配置文件：${CONFIG_FILE}"
+          sha256sum "${CONFIG_FILE}"
+
+      - name: Free disk space
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker system prune --all --force || true
+
+          df -h
+
+      - name: Install build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+
+          sudo apt-get install -y --no-install-recommends \
+            ack \
+            antlr3 \
+            asciidoc \
+            autoconf \
+            automake \
+            autopoint \
+            binutils \
+            bison \
+            build-essential \
+            bzip2 \
+            ccache \
+            clang \
+            cmake \
+            cpio \
+            curl \
+            device-tree-compiler \
+            flex \
+            g++ \
+            gawk \
+            gcc-multilib \
+            g++-multilib \
+            genisoimage \
+            gettext \
+            git \
+            gperf \
+            haveged \
+            help2man \
+            intltool \
+            lib32gcc-s1 \
+            libc6-dev-i386 \
+            libelf-dev \
+            libglib2.0-dev \
+            libgmp3-dev \
+            libgnutls28-dev \
+            libltdl-dev \
+            libmpc-dev \
+            libmpfr-dev \
+            libncurses-dev \
+            libpython3-dev \
+            libreadline-dev \
+            libssl-dev \
+            libtool \
+            libyaml-dev \
+            lld \
+            llvm \
+            lrzsz \
+            msmtp \
+            ninja-build \
+            p7zip-full \
+            patch \
+            pkgconf \
+            python3 \
+            python3-docutils \
+            python3-pip \
+            python3-ply \
+            python3-pyelftools \
+            python3-setuptools \
+            qemu-utils \
+            re2c \
+            rsync \
+            scons \
+            squashfs-tools \
+            subversion \
+            swig \
+            texinfo \
+            time \
+            uglifyjs \
+            unzip \
+            wget \
+            xmlto \
+            xsltproc \
+            xxd \
+            zlib1g-dev \
+            zstd
+
+          sudo apt-get clean
+
+      - name: Clone padavanonly ImmortalWrt source
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git clone \
+            --filter=blob:none \
+            --single-branch \
+            --branch "${OPENWRT_BRANCH}" \
+            "${OPENWRT_REPO}" \
+            "${OPENWRT_DIR}"
+
+          cd "${OPENWRT_DIR}"
+
+          SOURCE_COMMIT="$(git rev-parse HEAD)"
+          SOURCE_SHORT_SHA="$(git rev-parse --short=8 HEAD)"
+
+          echo "sha=${SOURCE_COMMIT}" >> "${GITHUB_OUTPUT}"
+          echo "short_sha=${SOURCE_SHORT_SHA}" >> "${GITHUB_OUTPUT}"
+
+          echo "SOURCE_COMMIT=${SOURCE_COMMIT}" >> "${GITHUB_ENV}"
+          echo "SOURCE_SHORT_SHA=${SOURCE_SHORT_SHA}" >> "${GITHUB_ENV}"
+          echo "BUILD_DATE=$(date +'%Y.%m.%d')" >> "${GITHUB_ENV}"
+          echo "BUILD_ID=$(date +'%Y%m%d-%H%M')" >> "${GITHUB_ENV}"
+
+          echo "源码分支：$(git branch --show-current)"
+          echo "源码提交：${SOURCE_COMMIT}"
+          git log -1 --oneline
+
+      - name: Restore download cache
+        id: dl-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: openwrt/dl
+          key: >-
+            ct3003-dl-${{ env.CACHE_VERSION }}-${{ runner.os }}-${{
+            steps.source.outputs.sha }}-${{
+            hashFiles('defconfig/ct3003.config') }}
+          restore-keys: |
+            ct3003-dl-${{ env.CACHE_VERSION }}-${{ runner.os }}-${{ steps.source.outputs.sha }}-
+            ct3003-dl-${{ env.CACHE_VERSION }}-${{ runner.os }}-
+
+      - name: Restore ccache
+        id: ccache
+        if: >-
+          ${{ github.event_name != 'workflow_dispatch' ||
+          inputs.clean_build == false }}
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: >-
+            ct3003-ccache-${{ env.CACHE_VERSION }}-${{ runner.os }}-${{
+            steps.source.outputs.sha }}-${{
+            hashFiles('defconfig/ct3003.config') }}
+          restore-keys: |
+            ct3003-ccache-${{ env.CACHE_VERSION }}-${{ runner.os }}-${{ steps.source.outputs.sha }}-
+            ct3003-ccache-${{ env.CACHE_VERSION }}-${{ runner.os }}-
+
+      - name: Configure ccache
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "${CCACHE_DIR}"
+          ccache --set-config=cache_dir="${CCACHE_DIR}"
+          ccache --set-config=max_size=5G
+          ccache --set-config=compression=true
+          ccache --zero-stats
+          ccache --show-config
+
+      - name: Update and install feeds
+        working-directory: ${{ env.OPENWRT_DIR }}
+        shell: bash
+        run: |
+          set -o pipefail
+
+          ./scripts/feeds update -a \
+            2>&1 | tee ../feeds-update.log
+
+          ./scripts/feeds install -a \
+            2>&1 | tee ../feeds-install.log
+
+      - name: Apply CT3003 configuration
+        working-directory: ${{ env.OPENWRT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -o pipefail
+
+          cp "../${CONFIG_FILE}" .config
+
+          sed -i \
+            -e '/^CONFIG_LOCALMIRROR=/d' \
+            -e '/^# CONFIG_LOCALMIRROR is not set$/d' \
+            .config
+
+          printf 'CONFIG_LOCALMIRROR="%s"\n' \
+            "${SOURCE_MIRROR}" >> .config
+
+          make defconfig \
+            2>&1 | tee ../defconfig.log
+
+          cp .config ../ct3003-final.config
+
+          grep -qx \
+            "CONFIG_LOCALMIRROR=\"${SOURCE_MIRROR}\"" \
+            .config || {
+              echo "ERROR: LOCALMIRROR 未生效"
+              exit 1
+            }
+
+      - name: Verify CT3003 configuration
+        working-directory: ${{ env.OPENWRT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          require_y() {
+            local symbol="$1"
+
+            if grep -qx "${symbol}=y" .config; then
+              echo "OK: ${symbol}=y"
+            else
+              echo "ERROR: ${symbol}=y 未生效"
+              grep -E "^${symbol}(=| )" .config || true
+              exit 1
+            fi
+          }
+
+          require_disabled() {
+            local symbol="$1"
+
+            if grep -qE "^${symbol}=(y|m)$" .config; then
+              echo "ERROR: ${symbol} 不应启用"
+              grep -E "^${symbol}=(y|m)$" .config
+              exit 1
+            else
+              echo "OK: ${symbol} 未启用"
+            fi
+          }
+
+          echo "===== 单一 CT3003 设备 ====="
+
+          mapfile -t SELECTED_TARGETS < <(
+            grep -E \
+              '^CONFIG_TARGET(_DEVICE)?_mediatek_filogic_DEVICE_.*=y$' \
+              .config || true
+          )
+
+          printf '%s\n' "${SELECTED_TARGETS[@]:-}"
+
+          if (( ${#SELECTED_TARGETS[@]} != 1 )); then
+            echo "ERROR: 预期只选择一个 Filogic 设备，实际为 ${#SELECTED_TARGETS[@]}"
+            exit 1
+          fi
+
+          if [[ "${SELECTED_TARGETS[0]}" != \
+            "CONFIG_TARGET_mediatek_filogic_DEVICE_cetron_ct3003=y" ]]
+          then
+            echo "ERROR: 目标不是 cetron_ct3003"
+            echo "实际：${SELECTED_TARGETS[0]}"
+            exit 1
+          fi
+
+          require_disabled CONFIG_TARGET_MULTI_PROFILE
+          require_disabled CONFIG_TARGET_PER_DEVICE_ROOTFS
+          require_disabled CONFIG_TARGET_mediatek_filogic_DEVICE_cetron_ct3003-ubootmod
+
+          echo
+          echo "===== MT7981 Wi-Fi / HNAT ====="
+
+          require_y CONFIG_MTK_CHIP_MT7981
+          require_y CONFIG_MTK_MEMORY_SHRINK
+          require_y CONFIG_MTK_MEMORY_SHRINK_AGGRESS
+          require_y CONFIG_PACKAGE_kmod-mt_wifi
+          require_y CONFIG_PACKAGE_kmod-mediatek_hnat
+          require_y CONFIG_PACKAGE_kmod-warp
+          require_y CONFIG_PACKAGE_luci-app-mtwifi-cfg
+          require_y CONFIG_PACKAGE_luci-app-turboacc-mtk
+
+          echo
+          echo "===== 精简项 ====="
+
+          UNWANTED_PACKAGES=(
+            CONFIG_PACKAGE_luci-app-eqos-mtk
+            CONFIG_PACKAGE_luci-app-upnp
+            CONFIG_PACKAGE_luci-app-wrtbwmon
+            CONFIG_PACKAGE_luci-app-samba4
+            CONFIG_PACKAGE_luci-app-dockerman
+            CONFIG_PACKAGE_luci-app-openvpn
+            CONFIG_PACKAGE_luci-app-wireguard
+            CONFIG_PACKAGE_luci-app-passwall
+            CONFIG_PACKAGE_luci-app-ssr-plus
+            CONFIG_PACKAGE_luci-app-homeproxy
+            CONFIG_PACKAGE_luci-app-vssr
+            CONFIG_PACKAGE_luci-app-rclone
+            CONFIG_PACKAGE_luci-app-aria2
+            CONFIG_PACKAGE_luci-app-transmission
+            CONFIG_PACKAGE_luci-app-minidlna
+            CONFIG_PACKAGE_luci-app-usb-printer
+            CONFIG_PACKAGE_luci-app-ttyd
+            CONFIG_PACKAGE_htop
+            CONFIG_PACKAGE_tcpdump
+            CONFIG_PACKAGE_zram-swap
+          )
+
+          for option in "${UNWANTED_PACKAGES[@]}"; do
+            require_disabled "${option}"
+          done
+
+          echo "OK: CT3003 + MT7981 Wi-Fi + HNAT/WARP 精简配置"
+
+      - name: Optional SSH debug
+        if: ${{ inputs.ssh_debug == true }}
+        uses: mxschmitt/action-tmate@v3
+        timeout-minutes: 60
+
+      - name: Download package sources
+        working-directory: ${{ env.OPENWRT_DIR }}
+        shell: bash
+        run: |
+          set -o pipefail
+
+          mkdir -p dl
+
+          if ! CCACHE_DISABLE=1 make download -j8 V=s \
+            2>&1 | tee ../download-parallel.log
+          then
+            echo "并行下载未完成，清理异常小文件后降低并发重试。"
+
+            find dl \
+              -type f \
+              -size -1024c \
+              -print \
+              -delete || true
+
+            CCACHE_DISABLE=1 make download -j2 V=s \
+              2>&1 | tee ../download-retry.log
+          fi
+
+          du -sh dl
+
+      - name: Save download cache
+        if: >-
+          ${{ success() &&
+          steps.dl-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: openwrt/dl
+          key: ${{ steps.dl-cache.outputs.cache-primary-key }}
+
+      - name: Build firmware
+        working-directory: ${{ env.OPENWRT_DIR }}
+        shell: bash
+        run: |
+          set -o pipefail
+
+          if ! make -j"$(nproc)" V=s \
+            2>&1 | tee ../build-parallel.log
+          then
+            echo "并行编译失败，使用单线程重试以获得明确日志。"
+
+            make -j1 V=s \
+              2>&1 | tee ../build-single.log
+          fi
+
+      - name: Collect and verify CT3003 firmware
+        working-directory: ${{ env.OPENWRT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -d "${OUTPUT_DIR}" || {
+            echo "ERROR: 找不到 ${OUTPUT_DIR}"
+            exit 1
+          }
+
+          mapfile -t SYSUPGRADE_IMAGES < <(
+            find "${OUTPUT_DIR}" \
+              -maxdepth 1 \
+              -type f \
+              -name "*${DEVICE_NAME}*sysupgrade.bin" \
+              -print
+          )
+
+          mapfile -t FACTORY_IMAGES < <(
+            find "${OUTPUT_DIR}" \
+              -maxdepth 1 \
+              -type f \
+              -name "*${DEVICE_NAME}*factory.bin" \
+              -print
+          )
+
+          echo "找到的 CT3003 sysupgrade："
+          printf '%s\n' "${SYSUPGRADE_IMAGES[@]:-}"
+          echo "找到的 CT3003 factory："
+          printf '%s\n' "${FACTORY_IMAGES[@]:-}"
+
+          if (( ${#SYSUPGRADE_IMAGES[@]} != 1 )); then
+            echo "ERROR: 预期恰好一个 CT3003 sysupgrade.bin，实际为 ${#SYSUPGRADE_IMAGES[@]}"
+            exit 1
+          fi
+
+          if (( ${#FACTORY_IMAGES[@]} != 1 )); then
+            echo "ERROR: 预期恰好一个 CT3003 factory.bin，实际为 ${#FACTORY_IMAGES[@]}"
+            exit 1
+          fi
+
+          mkdir -p ../firmware
+
+          cp "${SYSUPGRADE_IMAGES[0]}" \
+            "../firmware/CT3003-${BUILD_DATE}-${SOURCE_SHORT_SHA}-sysupgrade.bin"
+
+          cp "${FACTORY_IMAGES[0]}" \
+            "../firmware/CT3003-${BUILD_DATE}-${SOURCE_SHORT_SHA}-factory.bin"
+
+          cp ../ct3003-final.config ../firmware/
+
+          if [[ -f "${OUTPUT_DIR}/profiles.json" ]]; then
+            cp "${OUTPUT_DIR}/profiles.json" ../firmware/
+          fi
+
+          if [[ -f "${OUTPUT_DIR}/sha256sums" ]]; then
+            cp "${OUTPUT_DIR}/sha256sums" \
+              ../firmware/upstream-sha256sums
+          fi
+
+          (
+            cd ../firmware
+            sha256sum *.bin > SHA256SUMS
+          )
+
+          ls -lh ../firmware
+
+      - name: Show ccache statistics
+        if: always()
+        shell: bash
+        run: |
+          ccache --show-stats || true
+
+      - name: Save ccache
+        if: >-
+          ${{ success() &&
+          steps.ccache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: >-
+            ct3003-ccache-${{ env.CACHE_VERSION }}-${{ runner.os }}-${{
+            steps.source.outputs.sha }}-${{
+            hashFiles('defconfig/ct3003.config') }}
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: CT3003-${{ env.BUILD_ID }}-${{ env.SOURCE_SHORT_SHA }}
+          path: firmware/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: CT3003-failure-logs-${{ github.run_number }}
+          path: |
+            *.log
+            ct3003-final.config
+            openwrt/.config
+            openwrt/logs/
+          if-no-files-found: ignore
+          retention-days: 7
