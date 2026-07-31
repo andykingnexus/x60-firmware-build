@@ -31,6 +31,7 @@ env:
   TZ: Asia/Taipei
   OPENWRT_REPO: https://github.com/RuijieNetworksCommunity/MT798X-6.6-24.10
   OPENWRT_BRANCH: openwrt-24.10-6.6
+  OPENWRT_COMMIT: 0c8989820a2047c92678babdf9dc52b2ce993fdb
   OPENWRT_DIR: openwrt
   CONFIG_FILE: defconfig/x60.config
   DEVICE_NAME: ruijie-rg-x60
@@ -178,7 +179,14 @@ jobs:
 
           cd "${OPENWRT_DIR}"
 
+          git checkout --detach "${OPENWRT_COMMIT}"
+
           SOURCE_COMMIT="$(git rev-parse HEAD)"
+
+          if [[ "${SOURCE_COMMIT}" != "${OPENWRT_COMMIT}" ]]; then
+            echo "ERROR: 源码提交与导出配置不一致"
+            exit 1
+          fi
           SOURCE_SHORT_SHA="$(git rev-parse --short=8 HEAD)"
 
           echo "sha=${SOURCE_COMMIT}" >> "${GITHUB_OUTPUT}"
@@ -380,6 +388,7 @@ jobs:
           require_y CONFIG_MTK_FIRST_IF_IPAILNA
           require_y CONFIG_MTK_MGMT_TXPWR_CTRL
           require_y CONFIG_PACKAGE_kmod-phy-airoha-en8811h
+          require_y CONFIG_PACKAGE_airoha-en8811h-firmware
 
           echo
           echo "===== HNAT / iptables compatibility ====="
@@ -571,11 +580,42 @@ jobs:
             exit 1
           fi
 
+          mapfile -t MANIFESTS < <(
+            find "${OUTPUT_DIR}" \
+              -maxdepth 1 \
+              -type f \
+              -name "*${DEVICE_NAME}*.manifest" \
+              -print
+          )
+
+          if (( ${#MANIFESTS[@]} != 1 )); then
+            echo "ERROR: 预期恰好生成一个 RG-X60 manifest，实际为 ${#MANIFESTS[@]}"
+            printf '%s\n' "${MANIFESTS[@]:-}"
+            exit 1
+          fi
+
+          grep -qE '^kmod-phy-airoha-en8811h[[:space:]]' \
+            "${MANIFESTS[0]}" || {
+              echo "ERROR: 最终 rootfs manifest 缺少 EN8811H 内核驱动"
+              exit 1
+            }
+
+          grep -qE '^airoha-en8811h-firmware[[:space:]]' \
+            "${MANIFESTS[0]}" || {
+              echo "ERROR: 最终 rootfs manifest 缺少 EN8811H 固件"
+              exit 1
+            }
+
+          echo "OK: 最终 rootfs 包含 EN8811H 驱动和固件"
+          grep -E '^(kmod-phy-airoha-en8811h|airoha-en8811h-firmware)[[:space:]]' \
+            "${MANIFESTS[0]}"
+
           mkdir -p ../firmware
 
           FINAL_IMAGE="../firmware/RG-X60-${BUILD_DATE}-${SOURCE_SHORT_SHA}-sysupgrade.bin"
 
           cp "${IMAGES[0]}" "${FINAL_IMAGE}"
+          cp "${MANIFESTS[0]}" ../firmware/RG-X60.manifest
           cp ../x60-final.config ../firmware/
 
           if [[ -f "${OUTPUT_DIR}/profiles.json" ]]; then
