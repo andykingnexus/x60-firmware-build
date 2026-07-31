@@ -1,4 +1,4 @@
-name: Build Cetron CT3003
+name: Build Cetron CT3003 U-BootMod
 
 on:
   push:
@@ -24,7 +24,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: build-ct3003-${{ github.ref }}
+  group: build-ct3003-ubootmod-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -33,7 +33,7 @@ env:
   OPENWRT_BRANCH: openwrt-24.10-6.6
   OPENWRT_DIR: openwrt
   CONFIG_FILE: defconfig/ct3003.config
-  DEVICE_NAME: cetron_ct3003
+  DEVICE_NAME: cetron_ct3003-ubootmod
   OUTPUT_DIR: bin/targets/mediatek/filogic
   CCACHE_DIR: ${{ github.workspace }}/.ccache
   SOURCE_MIRROR: https://sources.immortalwrt.org
@@ -41,7 +41,7 @@ env:
 
 jobs:
   build:
-    name: Build CT3003 firmware
+    name: Build CT3003 U-BootMod firmware
     runs-on: ubuntu-24.04
     timeout-minutes: 360
 
@@ -320,16 +320,16 @@ jobs:
           fi
 
           if [[ "${SELECTED_TARGETS[0]}" != \
-            "CONFIG_TARGET_mediatek_filogic_DEVICE_cetron_ct3003=y" ]]
+            "CONFIG_TARGET_mediatek_filogic_DEVICE_cetron_ct3003-ubootmod=y" ]]
           then
-            echo "ERROR: 目标不是 cetron_ct3003"
+            echo "ERROR: 目标不是 cetron_ct3003-ubootmod"
             echo "实际：${SELECTED_TARGETS[0]}"
             exit 1
           fi
 
           require_disabled CONFIG_TARGET_MULTI_PROFILE
           require_disabled CONFIG_TARGET_PER_DEVICE_ROOTFS
-          require_disabled CONFIG_TARGET_mediatek_filogic_DEVICE_cetron_ct3003-ubootmod
+          require_disabled CONFIG_TARGET_mediatek_filogic_DEVICE_cetron_ct3003
 
           echo
           echo "===== MT7981 Wi-Fi / HNAT ====="
@@ -374,7 +374,7 @@ jobs:
             require_disabled "${option}"
           done
 
-          echo "OK: CT3003 + MT7981 Wi-Fi + HNAT/WARP 精简配置"
+          echo "OK: CT3003 U-BootMod + MT7981 Wi-Fi + HNAT/WARP 精简配置"
 
       - name: Optional SSH debug
         if: ${{ inputs.ssh_debug == true }}
@@ -445,40 +445,22 @@ jobs:
             find "${OUTPUT_DIR}" \
               -maxdepth 1 \
               -type f \
-              -name "*${DEVICE_NAME}*sysupgrade.bin" \
+              -name "*${DEVICE_NAME}*sysupgrade.itb" \
               -print
           )
 
-          mapfile -t FACTORY_IMAGES < <(
-            find "${OUTPUT_DIR}" \
-              -maxdepth 1 \
-              -type f \
-              -name "*${DEVICE_NAME}*factory.bin" \
-              -print
-          )
-
-          echo "找到的 CT3003 sysupgrade："
+          echo "找到的 CT3003 U-BootMod sysupgrade："
           printf '%s\n' "${SYSUPGRADE_IMAGES[@]:-}"
-          echo "找到的 CT3003 factory："
-          printf '%s\n' "${FACTORY_IMAGES[@]:-}"
 
           if (( ${#SYSUPGRADE_IMAGES[@]} != 1 )); then
-            echo "ERROR: 预期恰好一个 CT3003 sysupgrade.bin，实际为 ${#SYSUPGRADE_IMAGES[@]}"
-            exit 1
-          fi
-
-          if (( ${#FACTORY_IMAGES[@]} != 1 )); then
-            echo "ERROR: 预期恰好一个 CT3003 factory.bin，实际为 ${#FACTORY_IMAGES[@]}"
+            echo "ERROR: 预期恰好一个 CT3003 U-BootMod sysupgrade.itb，实际为 ${#SYSUPGRADE_IMAGES[@]}"
             exit 1
           fi
 
           mkdir -p ../firmware
 
           cp "${SYSUPGRADE_IMAGES[0]}" \
-            "../firmware/CT3003-${BUILD_DATE}-${SOURCE_SHORT_SHA}-sysupgrade.bin"
-
-          cp "${FACTORY_IMAGES[0]}" \
-            "../firmware/CT3003-${BUILD_DATE}-${SOURCE_SHORT_SHA}-factory.bin"
+            "../firmware/CT3003-UBOOTMOD-${BUILD_DATE}-${SOURCE_SHORT_SHA}-sysupgrade.itb"
 
           cp ../ct3003-final.config ../firmware/
 
@@ -493,7 +475,7 @@ jobs:
 
           (
             cd ../firmware
-            sha256sum *.bin > SHA256SUMS
+            sha256sum *.itb > SHA256SUMS
           )
 
           ls -lh ../firmware
@@ -519,7 +501,7 @@ jobs:
       - name: Upload firmware
         uses: actions/upload-artifact@v4
         with:
-          name: CT3003-${{ env.BUILD_ID }}-${{ env.SOURCE_SHORT_SHA }}
+          name: CT3003-UBOOTMOD-${{ env.BUILD_ID }}-${{ env.SOURCE_SHORT_SHA }}
           path: firmware/
           if-no-files-found: error
           retention-days: 30
