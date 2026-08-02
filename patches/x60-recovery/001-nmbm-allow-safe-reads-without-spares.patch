@@ -1,0 +1,57 @@
+diff --git a/uboot-mtk-20250711/drivers/mtd/nmbm/nmbm-private.h b/uboot-mtk-20250711/drivers/mtd/nmbm/nmbm-private.h
+index c285aeb..0b49c04 100644
+--- a/uboot-mtk-20250711/drivers/mtd/nmbm/nmbm-private.h
++++ b/uboot-mtk-20250711/drivers/mtd/nmbm/nmbm-private.h
+@@ -104,6 +104,7 @@ struct nmbm_instance {
+ 	uint8_t *page_cache;
+ 
+ 	int protected;
++	int allow_protected_reads;
+ 
+ 	uint32_t block_count;
+ 	uint32_t data_block_count;
+diff --git a/uboot-mtk-20250711/drivers/mtd/nmbm/nmbm-core.c b/uboot-mtk-20250711/drivers/mtd/nmbm/nmbm-core.c
+index 0e19167..781ff21 100644
+--- a/uboot-mtk-20250711/drivers/mtd/nmbm/nmbm-core.c
++++ b/uboot-mtk-20250711/drivers/mtd/nmbm/nmbm-core.c
+@@ -2062,8 +2062,13 @@ static bool nmbm_load_info_table(struct nmbm_instance *ni, uint32_t ba,
+ 	 * exists, set the chip to read-only
+ 	 */
+ 	if (ni->mapping_blocks_ba == ni->mapping_blocks_top_ba) {
+-		nlog_warn(ni, "No spare unmapped blocks. Device is now read-only\n");
+ 		ni->protected = 1;
++		if (success) {
++			nlog_warn(ni, "No spare unmapped blocks. Writes are disabled; existing mappings remain readable\n");
++			ni->allow_protected_reads = 1;
++		} else {
++			nlog_warn(ni, "No spare unmapped blocks and only one info table found. Device is locked\n");
++		}
+ 	} else if (!success) {
+ 		nlog_warn(ni, "Only one info table found. Device is now read-only\n");
+ 		ni->protected = 1;
+@@ -2339,6 +2344,7 @@ static void nmbm_init_structure(struct nmbm_instance *ni)
+ 	ptr += ni->mapping_table_size;
+ 
+ 	ni->page_cache = (uint8_t *)ptr;
++	ni->allow_protected_reads = 0;
+ 
+ 	/* Initialize block state table */
+ 	ni->block_state_changed = 0;
+@@ -2609,7 +2615,7 @@ int nmbm_read_single_page(struct nmbm_instance *ni, uint64_t addr, void *data,
+ 		return -EINVAL;
+ 
+ 	/* Sanity check */
+-	if (ni->protected) {
++	if (ni->protected && !ni->allow_protected_reads) {
+ 		nlog_debug(ni, "Device is forced read-only\n");
+ 		return -EROFS;
+ 	}
+@@ -2647,7 +2653,7 @@ int nmbm_read_range(struct nmbm_instance *ni, uint64_t addr, size_t size,
+ 		return -EINVAL;
+ 
+ 	/* Sanity check */
+-	if (ni->protected) {
++	if (ni->protected && !ni->allow_protected_reads) {
+ 		nlog_debug(ni, "Device is forced read-only\n");
+ 		return -EROFS;
+ 	}
