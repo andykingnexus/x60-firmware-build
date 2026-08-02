@@ -1,0 +1,143 @@
+name: Build RG-X60-New NMBM Recovery FIP
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/build-x60-recovery-fip.yml
+      - patches/x60-recovery/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: x60-new-recovery-fip
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPOSITORY: Yuzhii0718/bl-mt798x-dhcpd
+  UPSTREAM_COMMIT: bcf40d6edaa17d80e1e7ec1e03600a665a22ddb4
+  BOARD: ruijie_rg-x60-new
+  VERSION: "2025"
+  PATCH_FILE: patches/x60-recovery/001-nmbm-allow-safe-reads-without-spares.patch
+
+jobs:
+  build:
+    name: Build recovery-only FIP
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            bison \
+            device-tree-compiler \
+            flex \
+            gcc-aarch64-linux-gnu \
+            libssl-dev \
+            nodejs \
+            npm \
+            python3 \
+            qemu-user-static
+
+      - name: Fetch pinned U-Boot source
+        run: |
+          git clone https://github.com/${UPSTREAM_REPOSITORY}.git source
+          git -C source checkout --detach "${UPSTREAM_COMMIT}"
+          test "$(git -C source rev-parse HEAD)" = "${UPSTREAM_COMMIT}"
+
+      - name: Apply read-only NMBM recovery patch
+        run: |
+          git -C source apply --check "${GITHUB_WORKSPACE}/${PATCH_FILE}"
+          git -C source apply "${GITHUB_WORKSPACE}/${PATCH_FILE}"
+
+      - name: Verify recovery safety and device layout
+        shell: bash
+        run: |
+          set -euo pipefail
+          core=source/uboot-mtk-20250711/drivers/mtd/nmbm/nmbm-core.c
+          private=source/uboot-mtk-20250711/drivers/mtd/nmbm/nmbm-private.h
+          config=source/uboot-mtk-20250711/configs/mt7986_ruijie_rg-x60-new_defconfig
+          dtsi=source/uboot-mtk-20250711/arch/arm/dts/mt7986a-ruijie-rg-x60.dtsi
+
+          grep -Fq 'int allow_protected_reads;' "${private}"
+          test "$(grep -Fc 'if (ni->protected && !ni->allow_protected_reads)' "${core}")" -eq 2
+          test "$(grep -Fc 'if (ni->protected || (ni->lower.flags & NMBM_F_READ_ONLY))' "${core}")" -eq 5
+          grep -Fq 'No spare unmapped blocks. Writes are disabled; existing mappings remain readable' "${core}"
+          grep -Fq 'Only one info table found. Device is now read-only' "${core}"
+          grep -Fq 'CONFIG_DEFAULT_DEVICE_TREE="mt7986a-ruijie-rg-x60-new"' "${config}"
+          grep -Fq 'CONFIG_MTDPARTS_DEFAULT="nmbm0:1024k(bl2),512k(u-boot-env),2048k(Factory),2048k(fip),512k(product_info),512k(kdump),109568k(ubi)"' "${config}"
+          grep -Fq 'label = "default";' "${dtsi}"
+          grep -Fq '109568k(ubi)' "${dtsi}"
+
+      - name: Build RG-X60-New recovery FIP
+        working-directory: source
+        run: |
+          make \
+            BOARD="${BOARD}" \
+            VERSION="${VERSION}" \
+            VARIANT=default \
+            MULTI_LAYOUT=0 \
+            FIXED_MTDPARTS=1 \
+            SIMG=0 \
+            UBIMNG=1 \
+            TELNETD=1 \
+            NAND_RAW=0 \
+            COPY_BL2=0 \
+            SILENT=Y
+
+      - name: Validate and package recovery FIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifact
+          mapfile -t images < <(find source/output -maxdepth 1 -type f \
+            -name 'fip-mt7986_ruijie_rg-x60-new_2025-*-fixed-parts*.bin' \
+            -print)
+          test "${#images[@]}" -eq 1
+          image="${images[0]}"
+          output=artifact/mt7986_ruijie_rg-x60-new-fip-nmbm-read-recovery-107m.bin
+
+          size=$(stat -c '%s' "${image}")
+          test "${size}" -gt 0
+          test "${size}" -le $((0x200000))
+          cp "${image}" "${output}"
+
+          strings "${output}" | grep -Fq 'Ruijie RG-X60 New'
+          strings "${output}" | grep -Fq 'config@ruijie_x60_gsw_en8811h_phy'
+          strings "${output}" | grep -Fq '109568k(ubi)'
+          strings "${output}" | grep -Fq 'Writes are disabled; existing mappings remain readable'
+
+          sha256sum "${output}" | tee artifact/SHA256SUMS
+          md5sum "${output}" | tee artifact/MD5SUMS
+          {
+            echo "purpose=RG-X60-New NMBM read recovery"
+            echo "upstream=${UPSTREAM_REPOSITORY}"
+            echo "upstream_commit=${UPSTREAM_COMMIT}"
+            echo "board=${BOARD}"
+            echo "version=${VERSION}"
+            echo "variant=default"
+            echo "multi_layout=0"
+            echo "ubi_layout=107m"
+            echo "fip_partition_limit=2097152"
+            echo "image_size=${size}"
+            echo "nmbm_no_spare_writes=blocked"
+            echo "nmbm_valid_mapping_reads=allowed"
+            echo "nmbm_single_info_table_reads=blocked"
+          } | tee artifact/BUILD-INFO.txt
+
+      - name: Upload recovery FIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: RG-X60-New-NMBM-Recovery-FIP-107M-${{ github.run_number }}
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 30
