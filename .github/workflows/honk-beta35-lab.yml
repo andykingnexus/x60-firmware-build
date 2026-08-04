@@ -1,0 +1,734 @@
+name: honk beta35 gateway lab
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/honk-beta35-lab.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: honk-beta35-lab-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  lab:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 110
+    env:
+      HONK_REF: v0.0.1.beta.35
+      REPORT_DIR: /tmp/honk-lab-results
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout harness repository
+        uses: actions/checkout@v4
+
+      - name: Install host dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang llvm libbpf-dev libelf-dev zlib1g-dev \
+            cmake libclang-dev pkg-config iproute2 iputils-ping nftables \
+            bpftool jq curl unzip openssl python3 python3-pip netcat-openbsd \
+            iperf3 socat git
+          sudo mkdir -p "$REPORT_DIR" /etc/dae
+
+      - name: Checkout exact honk beta35 source
+        run: |
+          set -euxo pipefail
+          git clone --filter=blob:none --branch "$HONK_REF" --depth 1 \
+            https://github.com/Glassyiris/honk.git /tmp/honk
+          cd /tmp/honk
+          git rev-parse HEAD | tee "$REPORT_DIR/source-commit.txt"
+          git describe --tags --exact-match | tee "$REPORT_DIR/source-tag.txt"
+          test "$(git describe --tags --exact-match)" = "$HONK_REF"
+
+      - name: Install Rust toolchains
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install Rust nightly for eBPF
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src, llvm-tools
+
+      - name: Install bpf-linker
+        run: |
+          set -euxo pipefail
+          cargo install bpf-linker --locked
+          sed -i 's|linker=/root/.cargo/bin/bpf-linker-wrapper|linker=bpf-linker|' \
+            /tmp/honk/crates/honk-ebpf/.cargo/config.toml
+
+      - name: Install geo assets used by the user's routing model
+        run: |
+          set -euxo pipefail
+          sudo curl -fsSL --retry 4 -o /etc/dae/geosite.dat \
+            https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat
+          sudo curl -fsSL --retry 4 -o /etc/dae/geoip.dat \
+            https://github.com/v2fly/geoip/releases/latest/download/geoip.dat
+          sha256sum /etc/dae/geosite.dat /etc/dae/geoip.dat | tee "$REPORT_DIR/geo-assets.sha256"
+
+      - name: Run full workspace tests including known failures
+        id: full_tests
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          cd /tmp/honk
+          cargo +stable test --workspace --no-fail-fast -- --test-threads=2 \
+            2>&1 | tee "$REPORT_DIR/full-workspace-tests.log"
+
+      - name: Run official CI-equivalent test gate
+        run: |
+          set -euxo pipefail
+          cd /tmp/honk
+          cargo +stable test --workspace --no-fail-fast -- \
+            --skip test_config_toml_round_trip \
+            --skip test_to_file_and_from_file_by_extension \
+            --skip test_routing_with_config_dae \
+            2>&1 | tee "$REPORT_DIR/official-ci-gate.log"
+
+      - name: Add and run user-scenario routing tests
+        run: |
+          set -euxo pipefail
+          cd /tmp/honk
+          cat > crates/honk-core/tests/user_gateway_scenario.rs <<'RS'
+          use honk_config::parser::parse_dae_config;
+          use honk_config::types::DnsProtocol;
+          use honk_core::routing::{ConnectionInfo, Router};
+          use std::net::{IpAddr, Ipv4Addr};
+
+          fn connection(
+              domain: Option<&str>,
+              dst: &str,
+              port: u16,
+              protocol: &'static str,
+              mac: Option<&str>,
+          ) -> ConnectionInfo {
+              ConnectionInfo {
+                  domain: domain.map(str::to_string),
+                  dst_ip: dst.parse().unwrap(),
+                  dst_port: port,
+                  src_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 10, 150)),
+                  src_port: 50000,
+                  protocol,
+                  process_name: None,
+                  mac: mac.map(str::to_string),
+                  dscp: None,
+              }
+          }
+
+          #[test]
+          fn telegram_explicit_ipv4_rule_routes_to_tg_must() {
+              let cfg = parse_dae_config(r#"
+                  routing {
+                      dip(91.108.4.0/22, 91.108.8.0/22, 91.108.12.0/22, 91.108.16.0/22, 91.108.20.0/22, 91.108.56.0/22, 91.108.60.0/22, 149.154.160.0/20, 185.76.151.0/24) -> TG(must)
+                      fallback: proxy
+                  }
+              "#).unwrap();
+              let router = Router::new(&cfg.routing.rules, &cfg.routing.default_outbound).unwrap();
+              let (outbound, must) = router.route_with_must(&connection(
+                  None, "149.154.175.54", 443, "tcp", None,
+              ));
+              assert_eq!(outbound, "TG");
+              assert!(must);
+          }
+
+          #[test]
+          fn multiline_route_is_still_not_a_complete_dae_expression() {
+              let cfg = parse_dae_config(r#"
+                  routing {
+                      dip(
+                          91.108.4.0/22,
+                          149.154.160.0/20
+                      ) -> TG(must)
+                      fallback: proxy
+                  }
+              "#).unwrap();
+              let router = Router::new(&cfg.routing.rules, &cfg.routing.default_outbound).unwrap();
+              let (outbound, must) = router.route_with_must(&connection(
+                  None, "149.154.175.54", 443, "tcp", None,
+              ));
+              assert_eq!(outbound, "proxy");
+              assert!(!must);
+          }
+
+          #[test]
+          fn negated_mac_rule_matches_only_unlisted_clients() {
+              let cfg = parse_dae_config(r#"
+                  routing {
+                      !mac('00:11:22:33:44:55', '66:77:88:99:AA:BB') -> direct(must)
+                      fallback: proxy
+                  }
+              "#).unwrap();
+              let router = Router::new(&cfg.routing.rules, &cfg.routing.default_outbound).unwrap();
+
+              let (allowed, allowed_must) = router.route_with_must(&connection(
+                  None, "1.1.1.1", 443, "tcp", Some("12:34:56:78:9a:bc"),
+              ));
+              assert_eq!(allowed, "direct");
+              assert!(allowed_must);
+
+              let (listed, listed_must) = router.route_with_must(&connection(
+                  None, "1.1.1.1", 443, "tcp", Some("00:11:22:33:44:55"),
+              ));
+              assert_eq!(listed, "proxy");
+              assert!(!listed_must);
+          }
+
+          #[test]
+          fn tiktok_domain_before_udp443_block_wins_when_sni_is_known() {
+              let cfg = parse_dae_config(r#"
+                  routing {
+                      domain(suffix: tiktok.com) -> UNblock
+                      l4proto(udp) && dport(443) -> block
+                      fallback: proxy
+                  }
+              "#).unwrap();
+              let router = Router::new(&cfg.routing.rules, &cfg.routing.default_outbound).unwrap();
+
+              assert_eq!(
+                  router.route(&connection(
+                      Some("api16-normal-c-useast1a.tiktok.com"),
+                      "203.0.113.10", 443, "udp", None,
+                  )),
+                  "UNblock"
+              );
+              assert_eq!(
+                  router.route(&connection(None, "203.0.113.10", 443, "udp", None)),
+                  "block"
+              );
+          }
+
+          #[test]
+          fn udp443_block_before_domain_rule_prevents_tiktok_routing() {
+              let cfg = parse_dae_config(r#"
+                  routing {
+                      l4proto(udp) && dport(443) -> block
+                      domain(suffix: tiktok.com) -> UNblock
+                      fallback: proxy
+                  }
+              "#).unwrap();
+              let router = Router::new(&cfg.routing.rules, &cfg.routing.default_outbound).unwrap();
+              assert_eq!(
+                  router.route(&connection(
+                      Some("api16-normal-c-useast1a.tiktok.com"),
+                      "203.0.113.10", 443, "udp", None,
+                  )),
+                  "block"
+              );
+          }
+
+          #[test]
+          fn multi_name_filter_resolves_exact_members() {
+              let cfg = parse_dae_config(r#"
+                  node {
+                      A: 'socks5://127.0.0.1:11001'
+                      B: 'socks5://127.0.0.1:11002'
+                      C: 'socks5://127.0.0.1:11003'
+                  }
+                  group {
+                      pool {
+                          filter: name('A', 'B')
+                          policy: urltest
+                      }
+                  }
+                  routing { fallback: pool }
+              "#).unwrap();
+              let group = cfg.groups.iter().find(|g| g.name == "pool").unwrap();
+              let selected_names: std::collections::HashSet<_> = cfg.nodes.iter()
+                  .filter(|n| group.nodes.contains(&n.id))
+                  .map(|n| n.name.as_str())
+                  .collect();
+              assert_eq!(selected_names.len(), 2);
+              assert!(selected_names.contains("A"));
+              assert!(selected_names.contains("B"));
+              assert!(!selected_names.contains("C"));
+          }
+
+          #[test]
+          fn tcp_plus_udp_dns_alias_currently_selects_udp_transport() {
+              let cfg = parse_dae_config(r#"
+                  dns {
+                      upstream {
+                          cfdns: 'tcp+udp://1.1.1.1:53'
+                      }
+                      routing {
+                          request { fallback: cfdns }
+                      }
+                  }
+                  routing { fallback: direct }
+              "#).unwrap();
+              let upstream = cfg.dns.upstream.iter().find(|u| u.name == "cfdns").unwrap();
+              assert!(matches!(upstream.protocol, DnsProtocol::Udp));
+          }
+
+          #[test]
+          fn real_geo_assets_match_tiktok_telegram_apple_and_cn() {
+              let cfg = parse_dae_config(r#"
+                  routing {
+                      domain(geosite:tiktok) -> UNblock
+                      domain(geosite:telegram) -> TG
+                      domain(geosite:apple) -> direct
+                      dip(geoip:cn) -> direct
+                      fallback: proxy
+                  }
+              "#).unwrap();
+              let router = Router::new(&cfg.routing.rules, &cfg.routing.default_outbound).unwrap();
+              assert_eq!(router.route_domain("www.tiktok.com").unwrap().outbound_name, "UNblock");
+              assert_eq!(router.route_domain("api.telegram.org").unwrap().outbound_name, "TG");
+              assert_eq!(router.route_domain("www.apple.com").unwrap().outbound_name, "direct");
+              assert_eq!(router.route(&connection(None, "223.5.5.5", 443, "tcp", None)), "direct");
+          }
+          RS
+          cargo +stable test -p honk-core --test user_gateway_scenario -- --nocapture \
+            2>&1 | tee "$REPORT_DIR/user-gateway-tests.log"
+
+      - name: Run subsystem quality gates
+        run: |
+          set -euxo pipefail
+          cd /tmp/honk
+          bash ci/dns-ci.sh 2>&1 | tee "$REPORT_DIR/dns-ci.log"
+          bash ci/clash-ci.sh 2>&1 | tee "$REPORT_DIR/clash-ci.log"
+          bash ci/outbound-ci.sh 2>&1 | tee "$REPORT_DIR/outbound-ci.log"
+
+      - name: Build eBPF object and release core
+        run: |
+          set -euxo pipefail
+          cd /tmp/honk/crates/honk-ebpf
+          cargo +nightly build --release -Zbuild-std=core --target bpfel-unknown-none \
+            2>&1 | tee "$REPORT_DIR/ebpf-build.log"
+          readelf -S target/bpfel-unknown-none/release/honk-ebpf | tee "$REPORT_DIR/ebpf-sections.txt"
+          grep -q '\.BTF' "$REPORT_DIR/ebpf-sections.txt"
+          cd /tmp/honk
+          cargo +stable build --release -p honk-core --features ebpf \
+            2>&1 | tee "$REPORT_DIR/core-build.log"
+          ./target/release/honk-core --version | tee "$REPORT_DIR/core-version.txt"
+
+      - name: Run root netns integration tests
+        id: netns_tests
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          cd /tmp/honk
+          sudo -E env PATH="$PATH" cargo +stable test -p honk-core --features ebpf --lib netns \
+            -- --ignored --test-threads=1 --nocapture \
+            2>&1 | tee "$REPORT_DIR/netns-tests.log"
+
+      - name: Run sing-box AnyTLS and Hysteria2 interoperability probes
+        id: protocol_interop
+        continue-on-error: true
+        run: |
+          set -euxo pipefail
+          cd /tmp/honk
+          cat > /tmp/protocol_servers.py <<'PY'
+          import socket, threading
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+          class H(BaseHTTPRequestHandler):
+              def do_GET(self):
+                  size = 8 * 1024 * 1024
+                  self.send_response(200)
+                  self.send_header('Content-Length', str(size))
+                  self.end_headers()
+                  chunk = b'x' * 65536
+                  for _ in range(size // len(chunk)):
+                      self.wfile.write(chunk)
+              def log_message(self, *args):
+                  pass
+
+          def udp_echo(port):
+              s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+              s.bind(('127.0.0.1', port))
+              while True:
+                  data, addr = s.recvfrom(65535)
+                  s.sendto(data, addr)
+
+          def dns(port):
+              s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+              s.bind(('127.0.0.1', port))
+              while True:
+                  q, addr = s.recvfrom(4096)
+                  if len(q) < 12:
+                      continue
+                  p = 12
+                  while p < len(q) and q[p] != 0:
+                      p += q[p] + 1
+                  question = q[12:min(len(q), p + 5)]
+                  resp = q[:2] + b'\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00' + question
+                  resp += b'\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04\xcb\x00\x71\x09'
+                  s.sendto(resp, addr)
+
+          threading.Thread(target=udp_echo, args=(18081,), daemon=True).start()
+          threading.Thread(target=dns, args=(15353,), daemon=True).start()
+          ThreadingHTTPServer(('127.0.0.1', 18080), H).serve_forever()
+          PY
+          python3 /tmp/protocol_servers.py > "$REPORT_DIR/protocol-servers.log" 2>&1 &
+          SERVERS_PID=$!
+
+          SB_VERSION=1.13.14
+          curl -fsSL --retry 4 -o /tmp/sing-box.tgz \
+            "https://github.com/SagerNet/sing-box/releases/download/v${SB_VERSION}/sing-box-${SB_VERSION}-linux-amd64.tar.gz"
+          tar -xzf /tmp/sing-box.tgz -C /tmp
+          SB="/tmp/sing-box-${SB_VERSION}-linux-amd64/sing-box"
+          "$SB" version | tee "$REPORT_DIR/sing-box-version.txt"
+
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+            -keyout /tmp/lab-key.pem -out /tmp/lab-cert.pem \
+            -subj '/CN=localhost' -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1'
+          cat > /tmp/sing-box-server.json <<'JSON'
+          {
+            "log": {"level": "info"},
+            "inbounds": [
+              {
+                "type": "anytls",
+                "tag": "anytls-in",
+                "listen": "127.0.0.1",
+                "listen_port": 18443,
+                "users": [{"name": "lab", "password": "lab-password"}],
+                "tls": {
+                  "enabled": true,
+                  "server_name": "localhost",
+                  "certificate_path": "/tmp/lab-cert.pem",
+                  "key_path": "/tmp/lab-key.pem"
+                }
+              },
+              {
+                "type": "hysteria2",
+                "tag": "hy2-in",
+                "listen": "127.0.0.1",
+                "listen_port": 18444,
+                "up_mbps": 1000,
+                "down_mbps": 1000,
+                "users": [{"name": "lab", "password": "lab-password"}],
+                "tls": {
+                  "enabled": true,
+                  "server_name": "localhost",
+                  "certificate_path": "/tmp/lab-cert.pem",
+                  "key_path": "/tmp/lab-key.pem"
+                }
+              }
+            ],
+            "outbounds": [{"type": "direct", "tag": "direct"}],
+            "route": {"final": "direct"}
+          }
+          JSON
+          "$SB" check -c /tmp/sing-box-server.json
+          "$SB" run -c /tmp/sing-box-server.json > "$REPORT_DIR/sing-box-server.log" 2>&1 &
+          SB_PID=$!
+          trap 'kill $SB_PID $SERVERS_PID 2>/dev/null || true' EXIT
+          sleep 2
+
+          ANYTLS_LINK='anytls://lab-password@127.0.0.1:18443?insecure=1&sni=localhost&idle_session_check_interval=5s&idle_session_timeout=30s&min_idle_session=1#sb-anytls'
+          HY2_LINK='hysteria2://lab-password@127.0.0.1:18444?insecure=1&sni=localhost&upmbps=1000&downmbps=1000#sb-hy2'
+
+          cargo +stable run --release -p honk-outbound --example bench_probe -- \
+            "$ANYTLS_LINK" 127.0.0.1:18080 127.0.0.1:18081 dials=8 duration=2 \
+            2>&1 | tee "$REPORT_DIR/anytls-singbox-probe.log"
+          cargo +stable run --release -p honk-outbound --example anytls_udp_probe -- \
+            "$ANYTLS_LINK" 127.0.0.1:15353 \
+            2>&1 | tee "$REPORT_DIR/anytls-singbox-dns.log"
+          cargo +stable run --release -p honk-outbound --example bench_probe -- \
+            "$HY2_LINK" 127.0.0.1:18080 127.0.0.1:18081 dials=8 duration=2 \
+            2>&1 | tee "$REPORT_DIR/hy2-singbox-probe.log"
+
+      - name: Run real eBPF OpenWrt-like gateway smoke, reload and WAN recreation
+        id: real_gateway
+        continue-on-error: true
+        run: |
+          set -euxo pipefail
+          cd /tmp/honk
+          sudo mkdir -p /sys/fs/bpf
+          mountpoint -q /sys/fs/bpf || sudo mount -t bpf bpf /sys/fs/bpf
+
+          cat > /tmp/honk-real-gateway.sh <<'SH'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+          REPORT_DIR=/tmp/honk-lab-results
+          HONK=/tmp/honk/target/release/honk-core
+          HPID=''
+          SPID=''
+
+          cleanup() {
+            set +e
+            [ -n "$HPID" ] && kill "$HPID" 2>/dev/null
+            [ -n "$SPID" ] && kill "$SPID" 2>/dev/null
+            pkill -f '/tmp/gateway_servers.py' 2>/dev/null
+            ip link del br-lan 2>/dev/null
+            ip link del pppoe-wan 2>/dev/null
+            for i in ra0 rax0 lan3; do ip link del "$i" 2>/dev/null; done
+            ip netns del client 2>/dev/null
+            ip netns del wan 2>/dev/null
+            ip netns del daens 2>/dev/null
+            ip link del dae0 2>/dev/null
+            ip rule del fwmark 0x8000000/0x8000000 table 100 2>/dev/null
+            ip route flush table 100 2>/dev/null
+          }
+          trap cleanup EXIT
+          cleanup
+
+          cat > /tmp/gateway_servers.py <<'PY'
+          import socket, threading, time
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+          class H(BaseHTTPRequestHandler):
+              def do_GET(self):
+                  if self.path == '/large':
+                      size = 16 * 1024 * 1024
+                      self.send_response(200)
+                      self.send_header('Content-Length', str(size))
+                      self.end_headers()
+                      chunk = b'z' * 32768
+                      for _ in range(size // len(chunk)):
+                          self.wfile.write(chunk)
+                          time.sleep(0.002)
+                  else:
+                      body = b'HONK-GATEWAY-OK\n'
+                      self.send_response(200)
+                      self.send_header('Content-Length', str(len(body)))
+                      self.end_headers()
+                      self.wfile.write(body)
+              def log_message(self, *args):
+                  pass
+
+          def udp_echo():
+              s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+              s.bind(('10.0.0.2', 18081))
+              while True:
+                  data, addr = s.recvfrom(65535)
+                  s.sendto(data, addr)
+
+          def dns():
+              s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+              s.bind(('10.0.0.2', 5300))
+              while True:
+                  q, addr = s.recvfrom(4096)
+                  if len(q) < 12:
+                      continue
+                  p = 12
+                  while p < len(q) and q[p] != 0:
+                      p += q[p] + 1
+                  question = q[12:min(len(q), p + 5)]
+                  resp = q[:2] + b'\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00' + question
+                  resp += b'\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04\xcb\x00\x71\x09'
+                  s.sendto(resp, addr)
+
+          threading.Thread(target=udp_echo, daemon=True).start()
+          threading.Thread(target=dns, daemon=True).start()
+          ThreadingHTTPServer(('10.0.0.2', 18080), H).serve_forever()
+          PY
+
+          setup_wan() {
+            ip netns add wan 2>/dev/null || true
+            ip link add pppoe-wan type veth peer name wan0
+            ip link set wan0 netns wan
+            ip addr add 10.0.0.1/24 dev pppoe-wan
+            ip link set pppoe-wan up
+            ip netns exec wan ip addr add 10.0.0.2/24 dev wan0
+            ip netns exec wan ip link set lo up
+            ip netns exec wan ip link set wan0 up
+            ip netns exec wan ip route add 192.168.10.0/24 via 10.0.0.1
+            ip netns exec wan python3 /tmp/gateway_servers.py > "$REPORT_DIR/gateway-servers.log" 2>&1 &
+            SPID=$!
+          }
+
+          ip netns add client
+          ip link add br-lan type bridge
+          ip link set br-lan up
+          ip addr add 192.168.10.1/24 dev br-lan
+          ip link add lan2 type veth peer name client0
+          ip link set client0 netns client
+          ip link set lan2 master br-lan
+          ip link set lan2 up
+          for i in ra0 rax0 lan3; do
+            ip link add "$i" type dummy
+            ip link set "$i" master br-lan
+            ip link set "$i" up
+          done
+          ip netns exec client ip addr add 192.168.10.150/24 dev client0
+          ip netns exec client ip link set lo up
+          ip netns exec client ip link set client0 up
+          ip netns exec client ip route add default via 192.168.10.1
+          setup_wan
+          sysctl -w net.ipv4.ip_forward=1
+
+          cat > /tmp/honk-gateway.dae <<'DAE'
+          global {
+              tproxy_port: 12345
+              lan_interface: br-lan
+              wan_interface: pppoe-wan
+              log_level: info
+              allow_insecure: true
+              auto_config_kernel_parameter: true
+              so_mark_from_dae: 0
+              sniffing_timeout: 30ms
+              dial_mode: domain
+              tcp_check_url: 'http://10.0.0.2:18080'
+              udp_check_dns: '10.0.0.2:5300'
+              check_interval: 3600s
+              bootstrap_resolver: '10.0.0.2:5300'
+          }
+          dns {
+              ipversion_prefer: 4
+              upstream {
+                  local: 'udp://10.0.0.2:5300'
+              }
+              routing {
+                  request {
+                      fallback: local
+                  }
+              }
+          }
+          routing {
+              dip(10.0.0.0/24) -> direct(must)
+              fallback: direct
+          }
+          experimental {
+              clash_api {
+                  external_controller: '127.0.0.1:19090'
+                  default_mode: 'Rule'
+              }
+              cache_file {
+                  enabled: true
+                  path: '/tmp/honk-gateway-cache.db'
+                  store_dns: true
+              }
+          }
+          DAE
+
+          nft list ruleset > "$REPORT_DIR/nft-before.txt" || true
+          RUST_LOG=info "$HONK" --config /tmp/honk-gateway.dae > "$REPORT_DIR/honk-real.log" 2>&1 &
+          HPID=$!
+          for _ in $(seq 1 40); do
+            curl -fsS http://127.0.0.1:19090/version >/dev/null 2>&1 && break
+            kill -0 "$HPID"
+            sleep 0.5
+          done
+          curl -fsS http://127.0.0.1:19090/version | tee "$REPORT_DIR/api-version.json"
+          curl -fsS http://127.0.0.1:19090/stats | tee "$REPORT_DIR/stats-before.json"
+
+          ip netns exec client curl -fsS --max-time 10 http://10.0.0.2:18080/ | grep -q HONK-GATEWAY-OK
+          ip netns exec client python3 - <<'PY'
+          import socket
+          s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(3)
+          s.sendto(b'udp-ok',('10.0.0.2',18081))
+          data,_=s.recvfrom(1024)
+          assert data==b'udp-ok',data
+          PY
+          ip netns exec client python3 - <<'PY'
+          import socket
+          q=b'\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03www\x07example\x03com\x00\x00\x01\x00\x01'
+          s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(5)
+          s.sendto(q,('10.0.0.2',53))
+          data,_=s.recvfrom(2048)
+          assert data[:2]==b'\x12\x34'
+          assert data.endswith(b'\xcb\x00\x71\x09')
+          PY
+
+          RSS_BEFORE=$(awk '/VmRSS/{print $2}' /proc/$HPID/status)
+          FD_BEFORE=$(find /proc/$HPID/fd -maxdepth 1 -type l | wc -l)
+          echo "rss_kb_before=$RSS_BEFORE fd_before=$FD_BEFORE" | tee "$REPORT_DIR/resource-before.txt"
+
+          ip netns exec client curl -fsS http://10.0.0.2:18080/large -o /tmp/large.bin &
+          LARGE_PID=$!
+          for _ in $(seq 1 10); do
+            kill -HUP "$HPID"
+            sleep 0.15
+          done
+          wait "$LARGE_PID"
+          test "$(stat -c %s /tmp/large.bin)" = 16777216
+
+          ip netns exec client bash -c 'seq 1 400 | xargs -P 32 -I{} curl -fsS --max-time 5 http://10.0.0.2:18080/ >/dev/null'
+          ip netns exec client python3 - <<'PY'
+          import socket
+          s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2)
+          for i in range(400):
+              p=i.to_bytes(4,'big')
+              s.sendto(p,('10.0.0.2',18081))
+              data,_=s.recvfrom(1024)
+              assert data==p
+          PY
+
+          RSS_AFTER_LOAD=$(awk '/VmRSS/{print $2}' /proc/$HPID/status)
+          FD_AFTER_LOAD=$(find /proc/$HPID/fd -maxdepth 1 -type l | wc -l)
+          echo "rss_kb_after_load=$RSS_AFTER_LOAD fd_after_load=$FD_AFTER_LOAD" | tee "$REPORT_DIR/resource-after-load.txt"
+
+          kill "$SPID" 2>/dev/null || true
+          SPID=''
+          ip link del pppoe-wan
+          ip netns del wan
+          sleep 2
+          setup_wan
+          sleep 8
+          ip netns exec client curl -fsS --max-time 10 http://10.0.0.2:18080/ | grep -q HONK-GATEWAY-OK
+          ip netns exec client python3 - <<'PY'
+          import socket
+          s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(5)
+          s.sendto(b'after-wan-recreate',('10.0.0.2',18081))
+          data,_=s.recvfrom(1024)
+          assert data==b'after-wan-recreate'
+          PY
+
+          tc filter show dev br-lan ingress | tee "$REPORT_DIR/tc-br-lan-ingress.txt"
+          tc filter show dev pppoe-wan ingress | tee "$REPORT_DIR/tc-wan-ingress.txt"
+          bpftool prog show | tee "$REPORT_DIR/bpftool-progs.txt"
+          curl -fsS http://127.0.0.1:19090/stats | tee "$REPORT_DIR/stats-after.json"
+          curl -fsS http://127.0.0.1:19090/memory | tee "$REPORT_DIR/memory.json" || true
+          nft list ruleset > "$REPORT_DIR/nft-after.txt" || true
+          diff -u "$REPORT_DIR/nft-before.txt" "$REPORT_DIR/nft-after.txt" > "$REPORT_DIR/nft-diff.txt" || true
+
+          RSS_FINAL=$(awk '/VmRSS/{print $2}' /proc/$HPID/status)
+          FD_FINAL=$(find /proc/$HPID/fd -maxdepth 1 -type l | wc -l)
+          cat > "$REPORT_DIR/gateway-summary.json" <<JSON
+          {
+            "tcp_direct": true,
+            "udp_direct": true,
+            "dns_intercept": true,
+            "reloads_during_active_16MiB_stream": 10,
+            "parallel_tcp_requests": 400,
+            "udp_echo_roundtrips": 400,
+            "wan_interface_recreation_recovered": true,
+            "rss_kb_before": $RSS_BEFORE,
+            "rss_kb_after_load": $RSS_AFTER_LOAD,
+            "rss_kb_final": $RSS_FINAL,
+            "fd_before": $FD_BEFORE,
+            "fd_after_load": $FD_AFTER_LOAD,
+            "fd_final": $FD_FINAL
+          }
+          JSON
+          cat "$REPORT_DIR/gateway-summary.json"
+          SH
+          chmod +x /tmp/honk-real-gateway.sh
+          sudo -E /tmp/honk-real-gateway.sh 2>&1 | tee "$REPORT_DIR/real-gateway-run.log"
+
+      - name: Write overall result summary
+        if: always()
+        run: |
+          {
+            echo '# honk v0.0.1.beta.35 validation summary'
+            echo
+            echo "- Exact source tag: $HONK_REF"
+            echo "- Full workspace tests step: ${{ steps.full_tests.outcome }}"
+            echo "- Root netns tests step: ${{ steps.netns_tests.outcome }}"
+            echo "- sing-box protocol interop step: ${{ steps.protocol_interop.outcome }}"
+            echo "- Real gateway datapath step: ${{ steps.real_gateway.outcome }}"
+            echo
+            if [ -f "$REPORT_DIR/gateway-summary.json" ]; then
+              echo '## Gateway smoke result'
+              echo '```json'
+              cat "$REPORT_DIR/gateway-summary.json"
+              echo '```'
+            fi
+          } | tee "$REPORT_DIR/SUMMARY.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload all evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: honk-beta35-lab-results
+          path: /tmp/honk-lab-results
+          if-no-files-found: error
+          retention-days: 7
