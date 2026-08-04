@@ -1,0 +1,137 @@
+name: honk beta35 gateway lab retry
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/honk-beta35-lab-retry.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: honk-beta35-lab-retry-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  lab:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 110
+    env:
+      HONK_REF: v0.0.1.beta.35
+      REPORT_DIR: /tmp/honk-lab-results
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout harness repository
+        uses: actions/checkout@v4
+
+      - name: Prepare result directory
+        run: sudo mkdir -p "$REPORT_DIR" /etc/dae && sudo chown -R "$USER:$USER" "$REPORT_DIR"
+
+      - name: Install host dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang llvm libbpf-dev libelf-dev zlib1g-dev \
+            cmake libclang-dev pkg-config iproute2 iputils-ping nftables \
+            jq curl unzip openssl python3 python3-pip python3-yaml netcat-openbsd \
+            iperf3 socat git linux-tools-common linux-tools-generic
+          BPFTOOL="$(find /usr/lib/linux-tools -type f -name bpftool 2>/dev/null | sort -V | tail -n1)"
+          test -n "$BPFTOOL"
+          sudo ln -sf "$BPFTOOL" /usr/local/bin/bpftool
+          /usr/local/bin/bpftool version | tee "$REPORT_DIR/bpftool-version.txt"
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src, llvm-tools
+
+      - name: Execute original lab steps with evidence preservation
+        id: lab_runner
+        continue-on-error: true
+        run: |
+          cat > /tmp/run_honk_lab.py <<'PY'
+          import json
+          import os
+          import pathlib
+          import subprocess
+          import sys
+          import yaml
+
+          workflow = pathlib.Path('.github/workflows/honk-beta35-lab.yml')
+          data = yaml.safe_load(workflow.read_text())
+          steps = data['jobs']['lab']['steps']
+          skip = {
+              'Checkout harness repository',
+              'Install host dependencies',
+              'Install Rust toolchains',
+              'Install Rust nightly for eBPF',
+              'Write overall result summary',
+              'Upload all evidence',
+          }
+          outcomes = {}
+          report = pathlib.Path(os.environ['REPORT_DIR'])
+          report.mkdir(parents=True, exist_ok=True)
+
+          for step in steps:
+              name = step.get('name', '<unnamed>')
+              script = step.get('run')
+              if name in skip or not script:
+                  continue
+              print(f'\n===== {name} =====', flush=True)
+              result = subprocess.run(
+                  ['bash', '-eo', 'pipefail', '-c', script],
+                  env=os.environ.copy(),
+                  text=True,
+              )
+              outcome = 'success' if result.returncode == 0 else 'failure'
+              outcomes[name] = {'outcome': outcome, 'returncode': result.returncode}
+              (report / 'step-outcomes.json').write_text(json.dumps(outcomes, indent=2))
+              if result.returncode and not step.get('continue-on-error', False):
+                  print(f'CRITICAL STEP FAILED: {name}; continuing only to preserve independent evidence', file=sys.stderr)
+
+          failed = [name for name, item in outcomes.items() if item['outcome'] != 'success']
+          print('\n===== FINAL STEP OUTCOMES =====')
+          print(json.dumps(outcomes, indent=2))
+          sys.exit(1 if failed else 0)
+          PY
+          python3 /tmp/run_honk_lab.py 2>&1 | tee "$REPORT_DIR/retry-runner.log"
+
+      - name: Write retry summary
+        if: always()
+        run: |
+          set -u
+          {
+            echo '# honk v0.0.1.beta.35 validation summary'
+            echo
+            echo "- Lab runner outcome: ${{ steps.lab_runner.outcome }}"
+            echo '- Exact OpenWrt-like topology and protocol tests are defined in the companion workflow.'
+            echo
+            if [ -f "$REPORT_DIR/step-outcomes.json" ]; then
+              echo '## Step outcomes'
+              echo '```json'
+              cat "$REPORT_DIR/step-outcomes.json"
+              echo '```'
+            fi
+            if [ -f "$REPORT_DIR/gateway-summary.json" ]; then
+              echo '## Real gateway smoke'
+              echo '```json'
+              cat "$REPORT_DIR/gateway-summary.json"
+              echo '```'
+            fi
+          } | tee "$REPORT_DIR/SUMMARY.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload all evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: honk-beta35-lab-results-retry
+          path: /tmp/honk-lab-results
+          if-no-files-found: error
+          retention-days: 7
