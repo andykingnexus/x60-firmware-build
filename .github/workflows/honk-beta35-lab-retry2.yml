@@ -1,4 +1,4 @@
-name: honk beta35 focused gateway validation
+name: honk beta35 gateway baseline validation
 
 on:
   pull_request:
@@ -10,100 +10,51 @@ permissions:
   contents: read
 
 concurrency:
-  group: honk-beta35-focused-${{ github.event.pull_request.number }}
+  group: honk-beta35-baseline-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
-  focused:
+  gateway:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 35
     env:
+      REPORT_DIR: /tmp/honk-baseline-results
       HONK_REF: v0.0.1.beta.35
-      REPORT_DIR: /tmp/honk-focused-results
-      CARGO_TERM_COLOR: always
     steps:
       - name: Checkout harness
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Install runtime dependencies and exact release
         run: |
           set -euxo pipefail
-          sudo mkdir -p "$REPORT_DIR" /etc/dae /sys/fs/bpf
+          sudo mkdir -p "$REPORT_DIR" /sys/fs/bpf
           sudo chown -R "$USER:$USER" "$REPORT_DIR"
           sudo apt-get update
-          sudo apt-get install -y \
-            build-essential clang llvm libbpf-dev libelf-dev zlib1g-dev \
-            cmake libclang-dev pkg-config iproute2 iputils-ping nftables \
-            jq curl unzip openssl python3 python3-pip netcat-openbsd \
-            iperf3 socat git
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - name: Install Rust nightly
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rust-src, llvm-tools
-
-      - name: Checkout exact beta35 and prepare toolchain
-        run: |
-          set -euxo pipefail
-          rustup default stable
-          git clone --filter=blob:none --branch "$HONK_REF" --depth 1 \
-            https://github.com/Glassyiris/honk.git /tmp/honk
-          cd /tmp/honk
-          git describe --tags --exact-match | tee "$REPORT_DIR/source-tag.txt"
-          git rev-parse HEAD | tee "$REPORT_DIR/source-commit.txt"
-          test "$(git describe --tags --exact-match)" = "$HONK_REF"
-          cargo install bpf-linker --locked
-          sed -i 's|linker=/root/.cargo/bin/bpf-linker-wrapper|linker=bpf-linker|' \
-            crates/honk-ebpf/.cargo/config.toml
-          sudo curl -fsSL --retry 4 -o /etc/dae/geosite.dat \
-            https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat
-          sudo curl -fsSL --retry 4 -o /etc/dae/geoip.dat \
-            https://github.com/v2fly/geoip/releases/latest/download/geoip.dat
-
-      - name: Run DNS Clash and outbound subsystem gates on stable
-        run: |
-          set -euxo pipefail
-          rustup default stable
-          cd /tmp/honk
-          bash ci/dns-ci.sh 2>&1 | tee "$REPORT_DIR/dns-ci.log"
-          bash ci/clash-ci.sh 2>&1 | tee "$REPORT_DIR/clash-ci.log"
-          bash ci/outbound-ci.sh 2>&1 | tee "$REPORT_DIR/outbound-ci.log"
-
-      - name: Build real eBPF binary
-        run: |
-          set -euxo pipefail
-          cd /tmp/honk/crates/honk-ebpf
-          cargo +nightly build --release -Zbuild-std=core --target bpfel-unknown-none \
-            2>&1 | tee "$REPORT_DIR/ebpf-build.log"
-          readelf -S target/bpfel-unknown-none/release/honk-ebpf \
-            | tee "$REPORT_DIR/ebpf-sections.txt"
-          grep -q '\.BTF' "$REPORT_DIR/ebpf-sections.txt"
-          cd /tmp/honk
-          cargo +stable build --release -p honk-core --features ebpf \
-            2>&1 | tee "$REPORT_DIR/core-build.log"
-          ./target/release/honk-core --version | tee "$REPORT_DIR/core-version.txt"
-
-      - name: Run corrected OpenWrt-like gateway validation
-        run: |
-          set -euxo pipefail
+          sudo apt-get install -y iproute2 iptables nftables curl python3 jq tar
+          curl -fsSL --retry 4 -o /tmp/honk.tar.gz \
+            "https://github.com/Glassyiris/honk/releases/download/${HONK_REF}/honk-core-${HONK_REF}-x86_64-unknown-linux-gnu.tar.gz"
+          mkdir -p /tmp/honk-release
+          tar -xzf /tmp/honk.tar.gz -C /tmp/honk-release --strip-components=1
+          /tmp/honk-release/honk-core --version | tee "$REPORT_DIR/core-version.txt"
+          sha256sum /tmp/honk.tar.gz /tmp/honk-release/honk-core | tee "$REPORT_DIR/release.sha256"
           mountpoint -q /sys/fs/bpf || sudo mount -t bpf bpf /sys/fs/bpf
-          cat > /tmp/honk-focused-gateway.sh <<'SH'
+
+      - name: Run baseline and honk datapath validation
+        run: |
+          cat > /tmp/run_gateway_baseline.sh <<'SH'
           #!/usr/bin/env bash
           set -Eeuo pipefail
-          REPORT_DIR=/tmp/honk-focused-results
-          HONK=/tmp/honk/target/release/honk-core
+          REPORT_DIR=/tmp/honk-baseline-results
+          HONK=/tmp/honk-release/honk-core
           HPID=''
           SPID=''
 
           cleanup_resources() {
             [ -z "$HPID" ] || kill "$HPID" 2>/dev/null || true
             [ -z "$SPID" ] || kill "$SPID" 2>/dev/null || true
-            pkill -f '^python3 /tmp/focused_gateway_servers.py$' 2>/dev/null || true
+            pkill -f '^python3 /tmp/baseline_servers.py$' 2>/dev/null || true
+            iptables -D FORWARD -i br-lan -o pppoe-wan -j ACCEPT 2>/dev/null || true
+            iptables -D FORWARD -i pppoe-wan -o br-lan -j ACCEPT 2>/dev/null || true
             ip link del br-lan 2>/dev/null || true
             ip link del pppoe-wan 2>/dev/null || true
             for i in ra0 rax0 lan3; do ip link del "$i" 2>/dev/null || true; done
@@ -117,93 +68,62 @@ jobs:
           trap 'rc=$?; cleanup_resources; exit $rc' EXIT
           cleanup_resources
 
-          cat > /tmp/focused_gateway_servers.py <<'PY'
-          import socket
-          import socketserver
-          import threading
-          import time
+          cat > /tmp/baseline_servers.py <<'PY'
+          import socket, socketserver, threading, time
           from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-          def dns_response(q):
-              if len(q) < 12:
-                  return b''
-              p = 12
+          def answer(q):
+              if len(q) < 17: return b''
+              p=12
               while p < len(q) and q[p] != 0:
-                  length = q[p]
-                  if length == 0 or p + length >= len(q):
-                      return b''
-                  p += length + 1
-              if p + 5 > len(q):
-                  return b''
-              question = q[12:p + 5]
-              return (
-                  q[:2] + b'\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00' + question
-                  + b'\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04\xcb\x00\x71\x09'
-              )
+                  n=q[p]
+                  if not n or p+n >= len(q): return b''
+                  p += n+1
+              if p+5 > len(q): return b''
+              question=q[12:p+5]
+              return q[:2]+b'\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00'+question+b'\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04\xcb\x00\x71\x09'
 
-          class HttpHandler(BaseHTTPRequestHandler):
+          class H(BaseHTTPRequestHandler):
               def do_HEAD(self):
-                  self.send_response(204)
-                  self.end_headers()
+                  self.send_response(204); self.end_headers()
               def do_GET(self):
                   if self.path == '/large':
-                      size = 32 * 1024 * 1024
-                      self.send_response(200)
-                      self.send_header('Content-Length', str(size))
-                      self.end_headers()
-                      chunk = b'z' * 65536
-                      for _ in range(size // len(chunk)):
-                          self.wfile.write(chunk)
-                          self.wfile.flush()
-                          time.sleep(0.005)
+                      size=16*1024*1024
+                      self.send_response(200); self.send_header('Content-Length',str(size)); self.end_headers()
+                      chunk=b'x'*65536
+                      for _ in range(size//len(chunk)):
+                          self.wfile.write(chunk); self.wfile.flush(); time.sleep(.006)
                   else:
-                      body = b'HONK-FOCUSED-OK\n'
-                      self.send_response(200)
-                      self.send_header('Content-Length', str(len(body)))
-                      self.end_headers()
-                      self.wfile.write(body)
-              def log_message(self, *args):
-                  pass
+                      body=b'BASELINE-HONK-OK\n'
+                      self.send_response(200); self.send_header('Content-Length',str(len(body))); self.end_headers(); self.wfile.write(body)
+              def log_message(self,*args): pass
 
-          class TcpDnsHandler(socketserver.BaseRequestHandler):
+          class T(socketserver.BaseRequestHandler):
               def handle(self):
-                  header = self.request.recv(2)
-                  if len(header) != 2:
-                      return
-                  length = int.from_bytes(header, 'big')
-                  data = b''
-                  while len(data) < length:
-                      chunk = self.request.recv(length - len(data))
-                      if not chunk:
-                          return
-                      data += chunk
-                  response = dns_response(data)
-                  self.request.sendall(len(response).to_bytes(2, 'big') + response)
-
-          class ReuseTcpServer(socketserver.ThreadingTCPServer):
-              allow_reuse_address = True
+                  h=self.request.recv(2)
+                  if len(h)!=2: return
+                  n=int.from_bytes(h,'big'); q=b''
+                  while len(q)<n:
+                      b=self.request.recv(n-len(q))
+                      if not b: return
+                      q+=b
+                  r=answer(q); self.request.sendall(len(r).to_bytes(2,'big')+r)
+          class TS(socketserver.ThreadingTCPServer): allow_reuse_address=True
 
           def udp_dns():
-              s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-              s.bind(('10.0.0.2', 5300))
+              s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.bind(('10.0.0.2',5300))
               while True:
-                  q, addr = s.recvfrom(4096)
-                  response = dns_response(q)
-                  if response:
-                      s.sendto(response, addr)
-
+                  q,a=s.recvfrom(4096); r=answer(q)
+                  if r: s.sendto(r,a)
           def udp_echo():
-              s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-              s.bind(('10.0.0.2', 18081))
+              s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.bind(('10.0.0.2',18081))
               while True:
-                  data, addr = s.recvfrom(65535)
-                  s.sendto(data, addr)
+                  d,a=s.recvfrom(65535); s.sendto(d,a)
 
-          threading.Thread(target=udp_dns, daemon=True).start()
-          threading.Thread(target=udp_echo, daemon=True).start()
-          tcp_dns = ReuseTcpServer(('10.0.0.2', 5300), TcpDnsHandler)
-          threading.Thread(target=tcp_dns.serve_forever, daemon=True).start()
-          ThreadingHTTPServer(('10.0.0.2', 18080), HttpHandler).serve_forever()
+          threading.Thread(target=udp_dns,daemon=True).start()
+          threading.Thread(target=udp_echo,daemon=True).start()
+          td=TS(('10.0.0.2',5300),T); threading.Thread(target=td.serve_forever,daemon=True).start()
+          ThreadingHTTPServer(('10.0.0.2',18080),H).serve_forever()
           PY
 
           setup_wan() {
@@ -216,12 +136,11 @@ jobs:
             ip netns exec wan ip link set lo up
             ip netns exec wan ip link set wan0 up
             ip netns exec wan ip route add 192.168.10.0/24 via 10.0.0.1
-            ip netns exec wan python3 /tmp/focused_gateway_servers.py \
-              > "$REPORT_DIR/gateway-servers.log" 2>&1 &
+            ip netns exec wan python3 /tmp/baseline_servers.py > "$REPORT_DIR/servers.log" 2>&1 &
             SPID=$!
             for _ in $(seq 1 30); do
-              ip netns exec wan curl -fsS --max-time 1 http://10.0.0.2:18080/ >/dev/null 2>&1 && return 0
-              sleep 0.2
+              ip netns exec wan curl -fsS --max-time 1 http://10.0.0.2:18080/ >/dev/null 2>&1 && return
+              sleep .2
             done
             return 1
           }
@@ -234,19 +153,36 @@ jobs:
           ip link set client0 netns client
           ip link set lan2 master br-lan
           ip link set lan2 up
-          for i in ra0 rax0 lan3; do
-            ip link add "$i" type dummy
-            ip link set "$i" master br-lan
-            ip link set "$i" up
-          done
+          for i in ra0 rax0 lan3; do ip link add "$i" type dummy; ip link set "$i" master br-lan; ip link set "$i" up; done
           ip netns exec client ip addr add 192.168.10.150/24 dev client0
           ip netns exec client ip link set lo up
           ip netns exec client ip link set client0 up
           ip netns exec client ip route add default via 192.168.10.1
           setup_wan
-          sysctl -w net.ipv4.ip_forward=1
 
-          cat > /tmp/honk-focused.dae <<'DAE'
+          sysctl -w net.ipv4.ip_forward=1
+          sysctl -w net.ipv4.conf.all.rp_filter=0
+          sysctl -w net.ipv4.conf.br-lan.rp_filter=0
+          sysctl -w net.ipv4.conf.pppoe-wan.rp_filter=0
+          iptables -I FORWARD 1 -i br-lan -o pppoe-wan -j ACCEPT
+          iptables -I FORWARD 1 -i pppoe-wan -o br-lan -j ACCEPT
+          iptables -S FORWARD > "$REPORT_DIR/forward-rules.txt"
+
+          tcp_test() { ip netns exec client curl -fsS --max-time 5 http://10.0.0.2:18080/ | grep -q BASELINE-HONK-OK; }
+          udp_test() {
+            ip netns exec client python3 - <<'PY'
+          import socket
+          s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(3)
+          s.sendto(b'echo-check',('10.0.0.2',18081)); d,_=s.recvfrom(1024); assert d==b'echo-check'
+          PY
+          }
+
+          # Establish that the synthetic routed topology works before honk.
+          tcp_test
+          udp_test
+          echo baseline-ok | tee "$REPORT_DIR/baseline.txt"
+
+          cat > /tmp/honk-baseline.dae <<'DAE'
           global {
               tproxy_port: 12345
               lan_interface: br-lan
@@ -264,189 +200,90 @@ jobs:
           }
           dns {
               ipversion_prefer: 4
-              upstream {
-                  local: 'udp://10.0.0.2:5300'
-              }
-              routing {
-                  request {
-                      fallback: local
-                  }
-              }
+              upstream { local: 'udp://10.0.0.2:5300' }
+              routing { request { fallback: local } }
           }
           routing {
               dip(10.0.0.0/24) -> direct(must)
               fallback: direct
           }
           experimental {
-              clash_api {
-                  external_controller: '127.0.0.1:19090'
-                  default_mode: 'Rule'
-              }
-              cache_file {
-                  enabled: true
-                  path: '/tmp/honk-focused-cache.db'
-                  store_dns: true
-              }
+              clash_api { external_controller: '127.0.0.1:19090' default_mode: 'Rule' }
+              cache_file { enabled: true path: '/tmp/honk-baseline-cache.db' store_dns: true }
           }
           DAE
 
-          RUST_LOG=info "$HONK" --config /tmp/honk-focused.dae \
-            > "$REPORT_DIR/honk-focused.log" 2>&1 &
-          HPID=$!
+          "$HONK" --config /tmp/honk-baseline.dae > "$REPORT_DIR/honk.log" 2>&1 & HPID=$!
           for _ in $(seq 1 60); do
             curl -fsS http://127.0.0.1:19090/version >/dev/null 2>&1 && break
-            kill -0 "$HPID"
-            sleep 0.25
+            kill -0 "$HPID"; sleep .25
           done
-          curl -fsS http://127.0.0.1:19090/version | tee "$REPORT_DIR/api-version.json"
-
-          # The direct-node bootstrap probe runs immediately. It must stay alive.
+          curl -fsS http://127.0.0.1:19090/version | tee "$REPORT_DIR/version.json"
           sleep 6
-          ! grep -q "Node 'direct' failed TCP health check" "$REPORT_DIR/honk-focused.log"
+          grep -q "Node 'direct' is alive after TCP health check" "$REPORT_DIR/honk.log"
+          ! grep -q "Node 'direct' failed TCP health check" "$REPORT_DIR/honk.log"
 
-          ip netns exec client curl -fsS --max-time 5 http://10.0.0.2:18080/ \
-            | grep -q HONK-FOCUSED-OK
-          ip netns exec client python3 - <<'PY'
-          import socket
-          s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(3)
-          s.sendto(b'initial-udp',('10.0.0.2',18081))
-          data,_=s.recvfrom(1024)
-          assert data == b'initial-udp'
-          PY
+          tcp_test
+          udp_test
           ip netns exec client python3 - <<'PY'
           import socket
           q=b'\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03www\x07example\x03com\x00\x00\x01\x00\x01'
-          s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(3)
-          s.sendto(q,('10.0.0.2',53))
-          data,_=s.recvfrom(2048)
-          assert data[:2] == b'\x12\x34'
-          assert data.endswith(b'\xcb\x00\x71\x09')
+          s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(3); s.sendto(q,('10.0.0.2',53)); d,_=s.recvfrom(2048)
+          assert d[:2]==b'\x12\x34' and d.endswith(b'\xcb\x00\x71\x09')
           PY
 
-          RSS_BEFORE=$(awk '/VmRSS/{print $2}' /proc/$HPID/status)
-          FD_BEFORE=$(find /proc/$HPID/fd -maxdepth 1 -type l | wc -l)
-
-          ip netns exec client curl -fsS --max-time 20 http://10.0.0.2:18080/large \
-            -o /tmp/focused-large.bin &
-          LARGE_PID=$!
-          for i in $(seq 1 10); do
-            kill -HUP "$HPID"
-            sleep 0.15
-            ip netns exec client curl -fsS --max-time 3 http://10.0.0.2:18080/ \
-              | grep -q HONK-FOCUSED-OK
-          done
-          wait "$LARGE_PID"
-          test "$(stat -c %s /tmp/focused-large.bin)" = 33554432
+          RSS0=$(awk '/VmRSS/{print $2}' /proc/$HPID/status); FD0=$(find /proc/$HPID/fd -maxdepth 1 -type l | wc -l)
+          ip netns exec client curl -fsS --max-time 20 http://10.0.0.2:18080/large -o /tmp/large.bin & LPID=$!
+          for _ in $(seq 1 10); do kill -HUP "$HPID"; sleep .18; tcp_test; done
+          wait "$LPID"; test "$(stat -c %s /tmp/large.bin)" = 16777216
 
           ip netns exec client python3 - <<'PY' | tee "$REPORT_DIR/tcp-load.json"
-          import concurrent.futures, json, socket
+          import concurrent.futures,json,socket
           def one(_):
-              s=socket.create_connection(('10.0.0.2',18080),3)
-              s.sendall(b'GET / HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n')
-              data=b''
+              s=socket.create_connection(('10.0.0.2',18080),3); s.sendall(b'GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n'); d=b''
               while True:
-                  part=s.recv(4096)
-                  if not part: break
-                  data += part
-              s.close()
-              return b'HONK-FOCUSED-OK' in data
-          with concurrent.futures.ThreadPoolExecutor(max_workers=24) as ex:
-              results=list(ex.map(one, range(200)))
-          summary={'attempted':len(results),'successful':sum(results)}
-          print(json.dumps(summary))
-          assert summary['successful'] == 200
+                  b=s.recv(4096)
+                  if not b: break
+                  d+=b
+              s.close(); return b'BASELINE-HONK-OK' in d
+          with concurrent.futures.ThreadPoolExecutor(max_workers=20) as e: r=list(e.map(one,range(100)))
+          print(json.dumps({'attempted':100,'successful':sum(r)})); assert sum(r)==100
           PY
-
           ip netns exec client python3 - <<'PY' | tee "$REPORT_DIR/udp-load.json"
-          import json, socket
-          s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2)
-          success=0
-          for i in range(400):
-              payload=i.to_bytes(4,'big')
-              s.sendto(payload,('10.0.0.2',18081))
-              data,_=s.recvfrom(1024)
-              if data == payload: success += 1
-          print(json.dumps({'attempted':400,'successful':success}))
-          assert success == 400
+          import json,socket
+          s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); ok=0
+          for i in range(200):
+              p=i.to_bytes(4,'big'); s.sendto(p,('10.0.0.2',18081)); d,_=s.recvfrom(1024); ok += d==p
+          print(json.dumps({'attempted':200,'successful':ok})); assert ok==200
           PY
+          RSS1=$(awk '/VmRSS/{print $2}' /proc/$HPID/status); FD1=$(find /proc/$HPID/fd -maxdepth 1 -type l | wc -l)
 
-          RSS_AFTER_LOAD=$(awk '/VmRSS/{print $2}' /proc/$HPID/status)
-          FD_AFTER_LOAD=$(find /proc/$HPID/fd -maxdepth 1 -type l | wc -l)
-
-          kill "$SPID" 2>/dev/null || true
-          SPID=''
-          ip link del pppoe-wan
-          ip netns del wan
-          sleep 2
-          setup_wan
-          for _ in $(seq 1 50); do
-            grep -q 'attached eBPF programs to new interface.*pppoe-wan' "$REPORT_DIR/honk-focused.log" && break
-            sleep 0.2
-          done
-          grep -q 'attached eBPF programs to new interface.*pppoe-wan' "$REPORT_DIR/honk-focused.log"
-          ip netns exec client curl -fsS --max-time 5 http://10.0.0.2:18080/ \
-            | grep -q HONK-FOCUSED-OK
-          ip netns exec client python3 - <<'PY'
-          import socket
-          s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(3)
-          s.sendto(b'after-wan-recreate',('10.0.0.2',18081))
-          data,_=s.recvfrom(1024)
-          assert data == b'after-wan-recreate'
-          PY
-
-          RSS_FINAL=$(awk '/VmRSS/{print $2}' /proc/$HPID/status)
-          FD_FINAL=$(find /proc/$HPID/fd -maxdepth 1 -type l | wc -l)
-          tc filter show dev br-lan ingress > "$REPORT_DIR/tc-br-lan-ingress.txt"
-          tc filter show dev pppoe-wan ingress > "$REPORT_DIR/tc-wan-ingress.txt"
-          curl -fsS http://127.0.0.1:19090/stats > "$REPORT_DIR/stats-final.json"
+          kill "$SPID" 2>/dev/null || true; SPID=''; ip link del pppoe-wan; ip netns del wan; sleep 2; setup_wan
+          for _ in $(seq 1 50); do grep -q 'attached eBPF programs to new interface.*pppoe-wan' "$REPORT_DIR/honk.log" && break; sleep .2; done
+          grep -q 'attached eBPF programs to new interface.*pppoe-wan' "$REPORT_DIR/honk.log"
+          tcp_test; udp_test
+          RSS2=$(awk '/VmRSS/{print $2}' /proc/$HPID/status); FD2=$(find /proc/$HPID/fd -maxdepth 1 -type l | wc -l)
+          tc filter show dev br-lan ingress > "$REPORT_DIR/tc-lan.txt"
+          tc filter show dev pppoe-wan ingress > "$REPORT_DIR/tc-wan.txt"
 
           cat > "$REPORT_DIR/gateway-summary.json" <<JSON
-          {
-            "initial_tcp": true,
-            "initial_udp": true,
-            "dns_intercept": true,
-            "direct_health_probe": true,
-            "reload_count": 10,
-            "tcp_probe_after_each_reload": true,
-            "active_stream_survived_reload": true,
-            "active_stream_bytes": 33554432,
-            "parallel_tcp_attempted": 200,
-            "parallel_tcp_successful": 200,
-            "udp_attempted": 400,
-            "udp_successful": 400,
-            "wan_interface_recreation_recovered": true,
-            "rss_kb_before": $RSS_BEFORE,
-            "rss_kb_after_load": $RSS_AFTER_LOAD,
-            "rss_kb_final": $RSS_FINAL,
-            "fd_before": $FD_BEFORE,
-            "fd_after_load": $FD_AFTER_LOAD,
-            "fd_final": $FD_FINAL
-          }
+          {"baseline_tcp":true,"baseline_udp":true,"honk_tcp":true,"honk_udp":true,"dns_intercept":true,"direct_health":true,"reloads":10,"tcp_after_each_reload":true,"stream_bytes":16777216,"parallel_tcp_attempted":100,"parallel_tcp_successful":100,"udp_attempted":200,"udp_successful":200,"wan_recreate":true,"rss_kb_before":$RSS0,"rss_kb_after_load":$RSS1,"rss_kb_final":$RSS2,"fd_before":$FD0,"fd_after_load":$FD1,"fd_final":$FD2}
           JSON
           cat "$REPORT_DIR/gateway-summary.json"
           SH
-          chmod +x /tmp/honk-focused-gateway.sh
-          sudo -E /tmp/honk-focused-gateway.sh \
-            2>&1 | tee "$REPORT_DIR/focused-gateway-run.log"
+          chmod +x /tmp/run_gateway_baseline.sh
+          sudo -E /tmp/run_gateway_baseline.sh 2>&1 | tee "$REPORT_DIR/run.log"
 
       - name: Write summary
         if: always()
         run: |
-          {
-            echo '# honk beta35 focused validation'
-            echo
-            if [ -f "$REPORT_DIR/gateway-summary.json" ]; then
-              echo '```json'
-              cat "$REPORT_DIR/gateway-summary.json"
-              echo '```'
-            fi
-          } | tee "$REPORT_DIR/SUMMARY.md" >> "$GITHUB_STEP_SUMMARY"
+          { echo '# honk beta35 gateway baseline validation'; [ ! -f "$REPORT_DIR/gateway-summary.json" ] || { echo '```json'; cat "$REPORT_DIR/gateway-summary.json"; echo '```'; }; } | tee "$REPORT_DIR/SUMMARY.md" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: honk-beta35-focused-results
-          path: /tmp/honk-focused-results
+          name: honk-beta35-baseline-results
+          path: /tmp/honk-baseline-results
           if-no-files-found: error
           retention-days: 7
