@@ -68,7 +68,7 @@ jobs:
           make dae TARGET=bpfel OUTPUT=/tmp/bench-bin/kdae CLANG=clang NOSTRIP=y
           /tmp/bench-bin/kdae --version
 
-      - name: Use FORWARD counter to prove Real Direct
+      - name: Patch harness validation for hosted runner
         shell: bash
         run: |
           set -euxo pipefail
@@ -76,6 +76,7 @@ jobs:
           from pathlib import Path
           p = Path('bench/kdae-chizi-direct.sh')
           s = p.read_text()
+
           old = '''  ip netns exec "$RTR" iptables -P FORWARD ACCEPT
             ip netns exec "$RTR" iptables -F FORWARD
           '''
@@ -86,6 +87,18 @@ jobs:
           if old not in s:
               raise SystemExit('topology patch target not found')
           s = s.replace(old, new, 1)
+
+          old = '''  write_kdae_config
+            ip netns exec "$RTR" taskset -c "$DAEMON_CPU" "$KDAE_BIN" run -c "$KDAE_CFG" --disable-pidfile --disable-sudo \\
+          '''
+          new = '''  write_kdae_config
+            chmod 600 "$KDAE_CFG"
+            ip netns exec "$RTR" taskset -c "$DAEMON_CPU" "$KDAE_BIN" run -c "$KDAE_CFG" --disable-pidfile --disable-sudo \\
+          '''
+          if old not in s:
+              raise SystemExit('KDAE permission patch target not found')
+          s = s.replace(old, new, 1)
+
           old = '''for v in direct chizi kdae; do
             echo "=== smoke $v ==="
             start_variant "$v" smoke
