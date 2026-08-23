@@ -93,10 +93,10 @@ jobs:
           '''
           new = '''  write_kdae_config
             chmod 600 "$KDAE_CFG"
-            ip netns exec "$RTR" taskset -c "$DAEMON_CPU" "$KDAE_BIN" run -c "$KDAE_CFG" --disable-pidfile --disable-sudo \\
+            ip netns exec "$RTR" bash -c 'mkdir -p /sys/fs/bpf; mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf; exec taskset -c "$1" "$2" run -c "$3" --disable-pidfile --disable-sudo' _ "$DAEMON_CPU" "$KDAE_BIN" "$KDAE_CFG" \\
           '''
           if old not in s:
-              raise SystemExit('KDAE permission patch target not found')
+              raise SystemExit('KDAE launch patch target not found')
           s = s.replace(old, new, 1)
 
           old = '''for v in direct chizi kdae; do
@@ -127,7 +127,12 @@ jobs:
           '''
           if old not in s:
               raise SystemExit('smoke patch target not found')
-          p.write_text(s.replace(old, new, 1))
+          s = s.replace(old, new, 1)
+
+          # Exclude functional smoke and warmup runs from medians.
+          s = s.replace("glob(f'*-{s}.json')", "glob(f'[0-9]-{s}.json')")
+          s = s.replace("glob(f'*-{s}.txt')", "glob(f'[0-9]-{s}.txt')")
+          p.write_text(s)
           PY
 
       - name: Run same-host Real Direct A/B
@@ -151,6 +156,7 @@ jobs:
           cat bench-results/env/validation.txt 2>/dev/null || true
           echo '--- logs ---'
           find bench-results/logs -maxdepth 1 -type f -print 2>/dev/null | sort || true
+          sudo chmod -R a+rX bench-results 2>/dev/null || true
 
       - uses: actions/upload-artifact@v4
         if: always()
