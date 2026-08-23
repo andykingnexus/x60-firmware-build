@@ -68,6 +68,55 @@ jobs:
           make dae TARGET=bpfel OUTPUT=/tmp/bench-bin/kdae CLANG=clang NOSTRIP=y
           /tmp/bench-bin/kdae --version
 
+      - name: Use FORWARD counter to prove Real Direct
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('bench/kdae-chizi-direct.sh')
+          s = p.read_text()
+          old = '''  ip netns exec "$RTR" iptables -P FORWARD ACCEPT
+            ip netns exec "$RTR" iptables -F FORWARD
+          '''
+          new = '''  ip netns exec "$RTR" iptables -P FORWARD ACCEPT
+            ip netns exec "$RTR" iptables -F FORWARD
+            ip netns exec "$RTR" iptables -A FORWARD -s "$APP_IP" -d "$SERVER_IP" -j ACCEPT
+          '''
+          if old not in s:
+              raise SystemExit('topology patch target not found')
+          s = s.replace(old, new, 1)
+          old = '''for v in direct chizi kdae; do
+            echo "=== smoke $v ==="
+            start_variant "$v" smoke
+            run_one "$v" smoke tcp-short 300ms 50ms
+            if [[ $v == chizi ]]; then
+              verify_chizi_bypass_cache
+            fi
+            stop_variant
+          done
+          '''
+          new = '''for v in direct chizi kdae; do
+            echo "=== smoke $v ==="
+            ip netns exec "$RTR" iptables -Z FORWARD
+            start_variant "$v" smoke
+            run_one "$v" smoke tcp-short 300ms 50ms
+            forwarded=$(ip netns exec "$RTR" iptables -L FORWARD -v -n -x | \
+              awk -v src="$APP_IP" -v dst="$SERVER_IP" '$8==src && $9==dst {print $1; exit}')
+            forwarded=${forwarded:-0}
+            echo "$v forward_counter_packets=$forwarded" | tee -a "$OUT/env/validation.txt"
+            if [[ $v != direct ]] && (( forwarded == 0 )); then
+              echo "$v did not use the normal Linux FORWARD path; refusing to label it Real Direct" >&2
+              exit 1
+            fi
+            stop_variant
+          done
+          '''
+          if old not in s:
+              raise SystemExit('smoke patch target not found')
+          p.write_text(s.replace(old, new, 1))
+          PY
+
       - name: Run same-host Real Direct A/B
         shell: bash
         run: |
