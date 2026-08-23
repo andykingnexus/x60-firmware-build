@@ -1,0 +1,31 @@
+name: eBPF benchmark capability probe
+
+on:
+  push:
+    branches:
+      - bench/chizi-kdae-direct-20260823
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Probe kernel and eBPF capabilities
+        shell: bash
+        run: |
+          set -euxo pipefail
+          uname -a
+          id
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq iproute2 bpftool libcap2-bin
+          sudo capsh --print || true
+          mount | grep cgroup || true
+          sudo mount -t bpf bpf /sys/fs/bpf 2>/dev/null || true
+          sudo ip netns add bench
+          sudo ip link add veth-a type veth peer name veth-b
+          sudo ip link set veth-b netns bench
+          sudo tc qdisc add dev veth-a clsact
+          sudo tc qdisc show dev veth-a
+          sudo bpftool feature probe kernel | head -n 120
+          sudo ip link del veth-a
+          sudo ip netns del bench
