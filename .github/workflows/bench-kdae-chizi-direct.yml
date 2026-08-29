@@ -1,0 +1,166 @@
+name: KDAE vs CHIZI Real Direct benchmark
+
+on:
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.0'
+          cache: false
+
+      - name: Install benchmark dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            iproute2 iptables nftables jq ethtool iputils-ping procps util-linux \
+            clang llvm lld make gcc git time libcap2-bin ca-certificates
+          sudo apt-get install -y -qq linux-tools-common linux-tools-azure || true
+          mountpoint -q /sys/fs/bpf || sudo mount -t bpf bpf /sys/fs/bpf
+          sudo modprobe cls_bpf || true
+          sudo modprobe act_bpf || true
+          sudo modprobe sch_clsact || true
+
+      - name: Build CHIZI eBPF and traffic generator
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/bench-bin
+          git clone --filter=blob:none --no-checkout https://github.com/CHIZI-0618/sing-box.git /tmp/chizi
+          git -C /tmp/chizi checkout f6bd1d0c44cda7b1b07ab4cfe35e75de47194447
+          cd /tmp/chizi
+          CGO_ENABLED=0 go build -trimpath -tags with_ebpf,with_gvisor \
+            -o /tmp/bench-bin/chizi-sing-box ./cmd/sing-box
+          CGO_ENABLED=0 go build -trimpath \
+            -o /tmp/bench-bin/interception-bench ./cmd/internal/interception_bench
+          /tmp/bench-bin/chizi-sing-box version
+
+      - name: Build current KDAE core
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git clone --filter=blob:none --no-checkout https://github.com/kenzok8/dae.git /tmp/kdae
+          git -C /tmp/kdae checkout 0dd83147223ea0c6af3efb48f465c375a97f30d9
+          git -C /tmp/kdae fetch --no-tags https://github.com/daeuniverse/dae caa6f5e91776bc86d5b0edc940bb7d264359863c
+          git -C /tmp/kdae -c user.name=bench -c user.email=bench@local \
+            merge --no-edit caa6f5e91776bc86d5b0edc940bb7d264359863c
+          git -C /tmp/kdae submodule update --init --recursive
+
+          git clone --filter=blob:none --no-checkout https://github.com/kenzok8/outbound.git /tmp/kdae-outbound
+          git -C /tmp/kdae-outbound checkout a4521b4298f99bb9c2d7431b469955837483f16c
+          git clone --filter=blob:none --no-checkout https://github.com/kenzok8/quic-go.git /tmp/kdae-quic
+          git -C /tmp/kdae-quic checkout 110ca0ac66af3d8b36b9452b46bb068c14fba4ce
+
+          cd /tmp/kdae
+          go mod edit -replace github.com/daeuniverse/outbound=../kdae-outbound
+          go mod edit -replace github.com/olicesx/quic-go=../kdae-quic
+          go mod tidy
+          make dae TARGET=bpfel OUTPUT=/tmp/bench-bin/kdae CLANG=clang NOSTRIP=y
+          /tmp/bench-bin/kdae --version
+
+      - name: Patch harness validation for hosted runner
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('bench/kdae-chizi-direct.sh')
+          s = p.read_text()
+
+          old = '''  ip netns exec "$RTR" iptables -P FORWARD ACCEPT
+            ip netns exec "$RTR" iptables -F FORWARD
+          '''
+          new = '''  ip netns exec "$RTR" iptables -P FORWARD ACCEPT
+            ip netns exec "$RTR" iptables -F FORWARD
+            ip netns exec "$RTR" iptables -A FORWARD -s "$APP_IP" -d "$SERVER_IP" -j ACCEPT
+          '''
+          if old not in s:
+              raise SystemExit('topology patch target not found')
+          s = s.replace(old, new, 1)
+
+          old = '''  write_kdae_config
+            ip netns exec "$RTR" taskset -c "$DAEMON_CPU" "$KDAE_BIN" run -c "$KDAE_CFG" --disable-pidfile --disable-sudo \\
+          '''
+          new = '''  write_kdae_config
+            chmod 600 "$KDAE_CFG"
+            ip netns exec "$RTR" bash -c 'mkdir -p /sys/fs/bpf; mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf; exec taskset -c "$1" "$2" run -c "$3" --disable-pidfile --disable-sudo' _ "$DAEMON_CPU" "$KDAE_BIN" "$KDAE_CFG" \\
+          '''
+          if old not in s:
+              raise SystemExit('KDAE launch patch target not found')
+          s = s.replace(old, new, 1)
+
+          old = '''for v in direct chizi kdae; do
+            echo "=== smoke $v ==="
+            start_variant "$v" smoke
+            run_one "$v" smoke tcp-short 300ms 50ms
+            if [[ $v == chizi ]]; then
+              verify_chizi_bypass_cache
+            fi
+            stop_variant
+          done
+          '''
+          new = '''for v in direct chizi kdae; do
+            echo "=== smoke $v ==="
+            ip netns exec "$RTR" iptables -Z FORWARD
+            start_variant "$v" smoke
+            run_one "$v" smoke tcp-short 300ms 50ms
+            forwarded=$(ip netns exec "$RTR" iptables -L FORWARD -v -n -x | \
+              awk -v src="$APP_IP" -v dst="$SERVER_IP" '$8==src && $9==dst {print $1; exit}')
+            forwarded=${forwarded:-0}
+            echo "$v forward_counter_packets=$forwarded" | tee -a "$OUT/env/validation.txt"
+            if [[ $v != direct ]] && (( forwarded == 0 )); then
+              echo "$v did not use the normal Linux FORWARD path; refusing to label it Real Direct" >&2
+              exit 1
+            fi
+            stop_variant
+          done
+          '''
+          if old not in s:
+              raise SystemExit('smoke patch target not found')
+          s = s.replace(old, new, 1)
+
+          # Exclude functional smoke and warmup runs from medians.
+          s = s.replace("glob(f'*-{s}.json')", "glob(f'[0-9]-{s}.json')")
+          s = s.replace("glob(f'*-{s}.txt')", "glob(f'[0-9]-{s}.txt')")
+          p.write_text(s)
+          PY
+
+      - name: Run same-host Real Direct A/B
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo -E env \
+            CHIZI_BIN=/tmp/bench-bin/chizi-sing-box \
+            KDAE_BIN=/tmp/bench-bin/kdae \
+            BENCH_BIN=/tmp/bench-bin/interception-bench \
+            OUT="$GITHUB_WORKSPACE/bench-results" \
+            REPS=3 DURATION=2s WARMUP=500ms CONCURRENCY=32 \
+            bash "$GITHUB_WORKSPACE/bench/kdae-chizi-direct.sh"
+
+      - name: Show summary
+        if: always()
+        shell: bash
+        run: |
+          cat bench-results/summary.md 2>/dev/null || true
+          echo '--- validation ---'
+          cat bench-results/env/validation.txt 2>/dev/null || true
+          echo '--- logs ---'
+          find bench-results/logs -maxdepth 1 -type f -print 2>/dev/null | sort || true
+          sudo chmod -R a+rX bench-results 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kdae-chizi-real-direct
+          path: bench-results
+          if-no-files-found: warn
